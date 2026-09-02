@@ -57,11 +57,13 @@ pub struct ForzaSession {
     authorization: String,
     signer: RequestSigner,
     local_xuid: Xuid,
+    expires_at: i64,
     endpoints: ServiceEndpoints,
 }
 
 impl ForzaSession {
     pub fn authenticate(authorization: TitleAuthorization) -> Result<Self, XboxServiceError> {
+        let expires_at = authorization.expires_at();
         let local_xuid =
             Xuid::new(authorization.xuid).map_err(|_| XboxServiceError::InvalidLocalXuid)?;
         Ok(Self {
@@ -69,8 +71,14 @@ impl ForzaSession {
             authorization: authorization.authorization,
             signer: authorization.signer,
             local_xuid,
+            expires_at,
             endpoints: ServiceEndpoints::production(),
         })
+    }
+
+    #[must_use]
+    pub fn expires_at_or_before(&self, unix_timestamp: i64) -> bool {
+        self.expires_at <= unix_timestamp
     }
 
     #[cfg(test)]
@@ -80,12 +88,14 @@ impl ForzaSession {
         signer: RequestSigner,
         local_xuid: Xuid,
         base: Url,
+        expires_at: i64,
     ) -> Self {
         Self {
             client,
             authorization,
             signer,
             local_xuid,
+            expires_at,
             endpoints: ServiceEndpoints {
                 peoplehub: base.clone(),
                 activity: base,
@@ -335,6 +345,7 @@ mod tests {
             signer,
             Xuid::new(LOCAL_XUID).unwrap(),
             base,
+            1_000,
         )
     }
 
@@ -367,6 +378,16 @@ mod tests {
         format!(
             r#"{{"userActivities":[{{"userId":"{xuid}","activities":[{{"titleId":1842668909,"connectionString":"{connection_string}"}}]}}]}}"#
         )
+    }
+
+    #[tokio::test]
+    async fn forza_session_expiry_predicate_has_a_deterministic_boundary() {
+        let (base, _) = mock_server(Vec::new()).await;
+        let session = session(base);
+
+        assert!(!session.expires_at_or_before(999));
+        assert!(session.expires_at_or_before(1_000));
+        assert!(session.expires_at_or_before(1_001));
     }
 
     #[tokio::test]

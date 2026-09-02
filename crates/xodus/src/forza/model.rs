@@ -117,8 +117,8 @@ struct FriendsResponse {
 #[serde(rename_all = "camelCase")]
 struct TransportFriend {
     xuid: String,
-    #[serde(alias = "gamertag")]
-    display_name: String,
+    display_name: Option<String>,
+    gamertag: Option<String>,
     presence_state: Option<String>,
     presence_text: Option<String>,
 }
@@ -140,9 +140,11 @@ fn convert_friends(response: FriendsResponse) -> Result<Vec<XboxFriend>, ModelEr
         .people
         .into_iter()
         .map(|friend| {
-            if friend.display_name.is_empty() {
-                return Err(ModelError::MissingDisplayName);
-            }
+            let display_name = friend
+                .display_name
+                .filter(|value| !value.is_empty())
+                .or_else(|| friend.gamertag.filter(|value| !value.is_empty()))
+                .ok_or(ModelError::MissingDisplayName)?;
             let presence = match friend.presence_state.as_deref() {
                 Some(state) if state.eq_ignore_ascii_case("online") => Presence::Online {
                     text: friend.presence_text,
@@ -152,7 +154,7 @@ fn convert_friends(response: FriendsResponse) -> Result<Vec<XboxFriend>, ModelEr
             };
             Ok(XboxFriend {
                 xuid: Xuid::new(friend.xuid)?,
-                display_name: friend.display_name,
+                display_name,
                 presence,
             })
         })
@@ -261,7 +263,38 @@ fn validate_invite_uri(uri: &Url) -> Result<(), ModelError> {
 mod tests {
     use serde_json::json;
 
-    use super::{Xuid, parse_activity};
+    use super::{ModelError, Xuid, parse_activity, parse_friends};
+
+    #[test]
+    fn peoplehub_prefers_nonempty_display_name_when_gamertag_is_also_present() {
+        let friends = parse_friends(
+            r#"{"people":[{"xuid":"2810000000000001","displayName":"Driver Display","gamertag":"DriverTag"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(friends[0].display_name, "Driver Display");
+    }
+
+    #[test]
+    fn peoplehub_uses_nonempty_gamertag_when_display_name_is_unusable() {
+        for body in [
+            r#"{"people":[{"xuid":"2810000000000001","gamertag":"DriverTag"}]}"#,
+            r#"{"people":[{"xuid":"2810000000000001","displayName":"","gamertag":"DriverTag"}]}"#,
+        ] {
+            let friends = parse_friends(body).unwrap();
+            assert_eq!(friends[0].display_name, "DriverTag");
+        }
+    }
+
+    #[test]
+    fn peoplehub_reports_missing_display_name_when_neither_name_is_usable() {
+        for body in [
+            r#"{"people":[{"xuid":"2810000000000001"}]}"#,
+            r#"{"people":[{"xuid":"2810000000000001","displayName":"","gamertag":""}]}"#,
+        ] {
+            assert_eq!(parse_friends(body), Err(ModelError::MissingDisplayName));
+        }
+    }
 
     #[test]
     fn activity_skips_non_joinable_candidates_before_a_valid_forza_session() {

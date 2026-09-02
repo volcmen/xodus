@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::Utc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use xodus::forza::ipc::{encode_frame, read_frame_after_magic};
@@ -16,6 +18,11 @@ use crate::invite_activation::InviteActivationRelay;
 
 const SOCIAL_MAGIC: [u8; 4] = *b"XDSO";
 const STALE_FRIEND_MESSAGE: &str = "Selected friend is no longer available";
+const SOCIAL_TIMEOUT_MESSAGE: &str = "Social request timed out";
+/// Bound the complete XDSO operation, including mutex acquisition and backend I/O.
+const SOCIAL_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Renew title authorization one minute early to avoid expiring during a request.
+const SESSION_REFRESH_MARGIN_SECONDS: i64 = 60;
 
 #[derive(Debug)]
 pub(crate) struct BackendFailure;
@@ -26,62 +33,152 @@ pub(crate) trait SocialBackend: Send {
     async fn join_friend(&mut self, friend: &Xuid) -> Result<InviteActivationUri, BackendFailure>;
 }
 
-pub(crate) struct ForzaBackend {
+trait BackendSession: Send {
+    fn expires_at_or_before(&self, unix_timestamp: i64) -> bool;
+    async fn refresh_friends(&mut self) -> Result<Vec<XboxFriend>, BackendFailure>;
+    async fn invite_friend(&mut self, friend: &Xuid) -> Result<(), BackendFailure>;
+    async fn join_friend(&mut self, friend: &Xuid) -> Result<InviteActivationUri, BackendFailure>;
+}
+
+impl BackendSession for ForzaSession {
+    fn expires_at_or_before(&self, unix_timestamp: i64) -> bool {
+        ForzaSession::expires_at_or_before(self, unix_timestamp)
+    }
+
+    async fn refresh_friends(&mut self) -> Result<Vec<XboxFriend>, BackendFailure> {
+        self.friends().await.map_err(|_| BackendFailure)
+    }
+
+    async fn invite_friend(&mut self, friend: &Xuid) -> Result<(), BackendFailure> {
+        self.invite(friend).await.map_err(|_| BackendFailure)
+    }
+
+    async fn join_friend(&mut self, friend: &Xuid) -> Result<InviteActivationUri, BackendFailure> {
+        self.join_uri(friend).await.map_err(|_| BackendFailure)
+    }
+}
+
+trait SessionMinter: Send {
+    type Session: BackendSession;
+
+    async fn mint(&mut self) -> Result<Self::Session, BackendFailure>;
+}
+
+struct ProductionSessionMinter {
     client: reqwest::Client,
     tokens: Arc<TokenManager>,
-    session: Option<ForzaSession>,
+}
+
+impl SessionMinter for ProductionSessionMinter {
+    type Session = ForzaSession;
+
+    async fn mint(&mut self) -> Result<Self::Session, BackendFailure> {
+        let authorization = xodus::tokens::mint_title_xsts(
+            &self.client,
+            &self.tokens,
+            FORZA_CLIENT_ID,
+            i64::from(FORZA_TITLE_ID),
+            XBOX_RELYING_PARTY,
+        )
+        .await
+        .map_err(|_| BackendFailure)?;
+        ForzaSession::authenticate(authorization).map_err(|_| BackendFailure)
+    }
+}
+
+struct SessionBackend<M>
+where
+    M: SessionMinter,
+{
+    minter: M,
+    session: Option<M::Session>,
+}
+
+impl<M> SessionBackend<M>
+where
+    M: SessionMinter,
+{
+    fn new(minter: M) -> Self {
+        Self {
+            minter,
+            session: None,
+        }
+    }
+
+    async fn session_at(&mut self, now: i64) -> Result<&mut M::Session, BackendFailure> {
+        let refresh_deadline = now.saturating_add(SESSION_REFRESH_MARGIN_SECONDS);
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.expires_at_or_before(refresh_deadline))
+        {
+            self.session = None;
+        }
+        if self.session.is_none() {
+            self.session = Some(self.minter.mint().await?);
+        }
+        self.session.as_mut().ok_or(BackendFailure)
+    }
+
+    async fn refresh_friends_at(&mut self, now: i64) -> Result<Vec<XboxFriend>, BackendFailure> {
+        let result = self.session_at(now).await?.refresh_friends().await;
+        if result.is_err() {
+            self.session = None;
+        }
+        result
+    }
+
+    async fn invite_friend_at(&mut self, friend: &Xuid, now: i64) -> Result<(), BackendFailure> {
+        let result = self.session_at(now).await?.invite_friend(friend).await;
+        if result.is_err() {
+            self.session = None;
+        }
+        result
+    }
+
+    async fn join_friend_at(
+        &mut self,
+        friend: &Xuid,
+        now: i64,
+    ) -> Result<InviteActivationUri, BackendFailure> {
+        let result = self.session_at(now).await?.join_friend(friend).await;
+        if result.is_err() {
+            self.session = None;
+        }
+        result
+    }
+}
+
+pub(crate) struct ForzaBackend {
+    inner: SessionBackend<ProductionSessionMinter>,
 }
 
 impl ForzaBackend {
     pub(crate) fn new(tokens: Arc<TokenManager>) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            tokens,
-            session: None,
+            inner: SessionBackend::new(ProductionSessionMinter {
+                client: reqwest::Client::new(),
+                tokens,
+            }),
         }
-    }
-
-    async fn session(&mut self) -> Result<&mut ForzaSession, BackendFailure> {
-        if self.session.is_none() {
-            let authorization = xodus::tokens::mint_title_xsts(
-                &self.client,
-                &self.tokens,
-                FORZA_CLIENT_ID,
-                i64::from(FORZA_TITLE_ID),
-                XBOX_RELYING_PARTY,
-            )
-            .await
-            .map_err(|_| BackendFailure)?;
-            self.session =
-                Some(ForzaSession::authenticate(authorization).map_err(|_| BackendFailure)?);
-        }
-        self.session.as_mut().ok_or(BackendFailure)
     }
 }
 
 impl SocialBackend for ForzaBackend {
     async fn refresh_friends(&mut self) -> Result<Vec<XboxFriend>, BackendFailure> {
-        self.session()
-            .await?
-            .friends()
-            .await
-            .map_err(|_| BackendFailure)
+        self.inner.refresh_friends_at(Utc::now().timestamp()).await
     }
 
     async fn invite_friend(&mut self, friend: &Xuid) -> Result<(), BackendFailure> {
-        self.session()
-            .await?
-            .invite(friend)
+        self.inner
+            .invite_friend_at(friend, Utc::now().timestamp())
             .await
-            .map_err(|_| BackendFailure)
     }
 
     async fn join_friend(&mut self, friend: &Xuid) -> Result<InviteActivationUri, BackendFailure> {
-        self.session()
-            .await?
-            .join_uri(friend)
+        self.inner
+            .join_friend_at(friend, Utc::now().timestamp())
             .await
-            .map_err(|_| BackendFailure)
     }
 }
 
@@ -199,6 +296,30 @@ fn stale_friend() -> SocialResponse {
 
 pub(crate) type SharedSocialService = Arc<Mutex<SocialService<ForzaBackend>>>;
 
+async fn run_social_operation<B>(
+    service: &Arc<Mutex<SocialService<B>>>,
+    request: SocialRequest,
+    activations: &InviteActivationRelay,
+    operation_timeout: Duration,
+) -> SocialResponse
+where
+    B: SocialBackend,
+{
+    match tokio::time::timeout(operation_timeout, async {
+        service.lock().await.handle(request, activations).await
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            log::warn!("Forza social operation timed out");
+            SocialResponse::Error {
+                message: SOCIAL_TIMEOUT_MESSAGE.to_owned(),
+            }
+        }
+    }
+}
+
 pub(crate) async fn handle_socket(
     socket: &mut tokio::net::UnixStream,
     service: &SharedSocialService,
@@ -207,7 +328,8 @@ pub(crate) async fn handle_socket(
     let request = read_frame_after_magic(socket, SOCIAL_MAGIC)
         .await
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let response = service.lock().await.handle(request, activations).await;
+    let response =
+        run_social_operation(service, request, activations, SOCIAL_OPERATION_TIMEOUT).await;
     let frame = encode_frame(&response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     socket.write_all(&frame).await
@@ -215,14 +337,20 @@ pub(crate) async fn handle_socket(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::future::pending;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use xodus::forza::{
         FriendHandle, InviteActivationUri, Presence, SocialRequest, SocialResponse, XboxFriend,
         Xuid,
     };
 
-    use super::{BackendFailure, SocialBackend, SocialService};
+    use super::{
+        BackendFailure, BackendSession, SessionBackend, SessionMinter, SocialBackend,
+        SocialService, run_social_operation,
+    };
     use crate::invite_activation::InviteActivationRelay;
 
     const FRIEND_XUID: &str = "2810999999999999";
@@ -238,6 +366,129 @@ mod tests {
         calls: Arc<Mutex<Calls>>,
         friends: Vec<XboxFriend>,
         join_uri: InviteActivationUri,
+    }
+
+    struct DelayedOnceBackend {
+        refreshes: usize,
+    }
+
+    impl SocialBackend for DelayedOnceBackend {
+        async fn refresh_friends(&mut self) -> Result<Vec<XboxFriend>, BackendFailure> {
+            self.refreshes += 1;
+            if self.refreshes == 1 {
+                pending::<()>().await;
+            }
+            Ok(vec![synthetic_friend()])
+        }
+
+        async fn invite_friend(&mut self, _friend: &Xuid) -> Result<(), BackendFailure> {
+            Err(BackendFailure)
+        }
+
+        async fn join_friend(
+            &mut self,
+            _friend: &Xuid,
+        ) -> Result<InviteActivationUri, BackendFailure> {
+            Err(BackendFailure)
+        }
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum FailingOperation {
+        None,
+        Refresh,
+        Invite,
+        Join,
+    }
+
+    #[derive(Default)]
+    struct SessionCalls {
+        mints: usize,
+        refreshes: usize,
+        invites: usize,
+        joins: usize,
+    }
+
+    struct SyntheticSession {
+        calls: Arc<Mutex<SessionCalls>>,
+        expires_at: i64,
+        failing_operation: FailingOperation,
+    }
+
+    impl BackendSession for SyntheticSession {
+        fn expires_at_or_before(&self, unix_timestamp: i64) -> bool {
+            self.expires_at <= unix_timestamp
+        }
+
+        async fn refresh_friends(&mut self) -> Result<Vec<XboxFriend>, BackendFailure> {
+            self.calls.lock().unwrap().refreshes += 1;
+            if self.failing_operation == FailingOperation::Refresh {
+                return Err(BackendFailure);
+            }
+            Ok(vec![synthetic_friend()])
+        }
+
+        async fn invite_friend(&mut self, _friend: &Xuid) -> Result<(), BackendFailure> {
+            self.calls.lock().unwrap().invites += 1;
+            if self.failing_operation == FailingOperation::Invite {
+                return Err(BackendFailure);
+            }
+            Ok(())
+        }
+
+        async fn join_friend(
+            &mut self,
+            _friend: &Xuid,
+        ) -> Result<InviteActivationUri, BackendFailure> {
+            self.calls.lock().unwrap().joins += 1;
+            if self.failing_operation == FailingOperation::Join {
+                return Err(BackendFailure);
+            }
+            Ok(InviteActivationUri::parse(ACTIVATION_URI).unwrap())
+        }
+    }
+
+    struct SyntheticMinter {
+        calls: Arc<Mutex<SessionCalls>>,
+        sessions: VecDeque<SyntheticSession>,
+    }
+
+    impl SessionMinter for SyntheticMinter {
+        type Session = SyntheticSession;
+
+        async fn mint(&mut self) -> Result<Self::Session, BackendFailure> {
+            self.calls.lock().unwrap().mints += 1;
+            self.sessions.pop_front().ok_or(BackendFailure)
+        }
+    }
+
+    fn synthetic_friend() -> XboxFriend {
+        XboxFriend {
+            xuid: Xuid::new(FRIEND_XUID).unwrap(),
+            display_name: "Synthetic Driver".to_owned(),
+            presence: Presence::Online { text: None },
+        }
+    }
+
+    fn session_backend(
+        sessions: impl IntoIterator<Item = (i64, FailingOperation)>,
+    ) -> (SessionBackend<SyntheticMinter>, Arc<Mutex<SessionCalls>>) {
+        let calls = Arc::new(Mutex::new(SessionCalls::default()));
+        let sessions = sessions
+            .into_iter()
+            .map(|(expires_at, failing_operation)| SyntheticSession {
+                calls: Arc::clone(&calls),
+                expires_at,
+                failing_operation,
+            })
+            .collect();
+        (
+            SessionBackend::new(SyntheticMinter {
+                calls: Arc::clone(&calls),
+                sessions,
+            }),
+            calls,
+        )
     }
 
     impl SocialBackend for SyntheticBackend {
@@ -282,6 +533,141 @@ mod tests {
             panic!("expected snapshot response");
         };
         snapshot.friends[0].handle
+    }
+
+    fn timeout_error() -> SocialResponse {
+        SocialResponse::Error {
+            message: "Social request timed out".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn social_operation_timeout_bounds_mutex_wait_and_recovers() {
+        let (service, _) = service();
+        let service = Arc::new(tokio::sync::Mutex::new(service));
+        let relay = InviteActivationRelay::default();
+        let gate = service.lock().await;
+
+        let response = run_social_operation(
+            &service,
+            SocialRequest::RefreshFriends,
+            &relay,
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(response, timeout_error());
+
+        drop(gate);
+        let response = run_social_operation(
+            &service,
+            SocialRequest::RefreshFriends,
+            &relay,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(response, SocialResponse::Snapshot(_)));
+    }
+
+    #[tokio::test]
+    async fn social_operation_timeout_drops_backend_future_and_recovers_gate() {
+        let service = Arc::new(tokio::sync::Mutex::new(SocialService::new(
+            DelayedOnceBackend { refreshes: 0 },
+        )));
+        let relay = InviteActivationRelay::default();
+
+        let response = run_social_operation(
+            &service,
+            SocialRequest::RefreshFriends,
+            &relay,
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(response, timeout_error());
+
+        let response = run_social_operation(
+            &service,
+            SocialRequest::RefreshFriends,
+            &relay,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(response, SocialResponse::Snapshot(_)));
+    }
+
+    #[tokio::test]
+    async fn social_backend_remints_at_the_expiry_safety_margin_before_reuse() {
+        let (mut backend, calls) = session_backend([
+            (160, FailingOperation::None),
+            (1_000, FailingOperation::None),
+        ]);
+
+        backend.refresh_friends_at(0).await.unwrap();
+        backend.refresh_friends_at(99).await.unwrap();
+        assert_eq!(calls.lock().unwrap().mints, 1);
+
+        backend.refresh_friends_at(100).await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.mints, 2);
+        assert_eq!(calls.refreshes, 3);
+    }
+
+    #[tokio::test]
+    async fn social_backend_peoplehub_failure_discards_session_without_retry() {
+        let (mut backend, calls) = session_backend([
+            (1_000, FailingOperation::Refresh),
+            (1_000, FailingOperation::None),
+        ]);
+
+        assert!(backend.refresh_friends_at(0).await.is_err());
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.mints, 1);
+            assert_eq!(calls.refreshes, 1);
+        }
+        assert!(backend.refresh_friends_at(0).await.is_ok());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.mints, 2);
+        assert_eq!(calls.refreshes, 2);
+    }
+
+    #[tokio::test]
+    async fn social_backend_invite_failure_discards_session_without_retry() {
+        let (mut backend, calls) = session_backend([
+            (1_000, FailingOperation::Invite),
+            (1_000, FailingOperation::None),
+        ]);
+        let friend = Xuid::new(FRIEND_XUID).unwrap();
+
+        assert!(backend.invite_friend_at(&friend, 0).await.is_err());
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.mints, 1);
+            assert_eq!(calls.invites, 1);
+        }
+        assert!(backend.invite_friend_at(&friend, 0).await.is_ok());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.mints, 2);
+        assert_eq!(calls.invites, 2);
+    }
+
+    #[tokio::test]
+    async fn social_backend_join_failure_discards_session_without_retry() {
+        let (mut backend, calls) = session_backend([
+            (1_000, FailingOperation::Join),
+            (1_000, FailingOperation::None),
+        ]);
+        let friend = Xuid::new(FRIEND_XUID).unwrap();
+
+        assert!(backend.join_friend_at(&friend, 0).await.is_err());
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.mints, 1);
+            assert_eq!(calls.joins, 1);
+        }
+        assert!(backend.join_friend_at(&friend, 0).await.is_ok());
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.mints, 2);
+        assert_eq!(calls.joins, 2);
     }
 
     #[tokio::test]
