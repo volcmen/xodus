@@ -1,0 +1,12 @@
+{
+  "people": [
+    {
+      "xuid": "2810000000000001",
+      "displayName": "Driver One",
+      "presenceState": "Online",
+      "presenceText": "Forza Motorsport",
+      "transportOnlyField": "must not escape parsing"
+    }
+  ],
+  "transportEnvelopeField": "must not escape parsing"
+}
