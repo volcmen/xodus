@@ -7,14 +7,32 @@ accepted upstream protocol, does not replace a general friends/chat UI, and has
 not been installed or validated with a game.
 
 - Official `xodus/main` base: `a92abacb0743f16c769279b9057c8c28435e5ef9`
-- Local source range: `a92abacb0743f16c769279b9057c8c28435e5ef9..40e76edc822c5880ad9f32b2daae69f15659751e`
-- Local Task 5 tip: `40e76edc822c5880ad9f32b2daae69f15659751e`
+- Local reviewed range: `a92abacb0743f16c769279b9057c8c28435e5ef9..fb38a3f7ad6c9112e8779f7908ffdcc2b2468f30`
+- Local source tip: `fb38a3f7ad6c9112e8779f7908ffdcc2b2468f30`
+- Task 5 feature tip: `40e76edc822c5880ad9f32b2daae69f15659751e`
 
 The range contains title-scoped authorization, Forza PeopleHub and Multiplayer
 Activity operations, bounded local social/activation protocols, a normal
 desktop overlay, and service-owned overlay process management. The game-facing
 `xgameruntime` bridge is planned and reviewed separately; it is not part of
 this Xodus branch.
+
+The reviewed source commits are:
+
+| Commit | Scope |
+| --- | --- |
+| `baa811b1d6d08b0cdd7e73a6a202d9b9e6616aec` | Title-scoped Xbox authorization |
+| `c4491c0ce8107b79de284062163191008772346c` | Authorization privacy hardening |
+| `4e297f65144a5d958e905e19adb9ba7927165a3c` | PeopleHub and Multiplayer Activity operations |
+| `b42de8d81e5b9b0f44a2fbe12b74e143d01ab00c` | Activity and PeopleHub contract hardening |
+| `778c25ae90278b600e804f32b7aee4839b3fec8d` | Bounded social and activation IPC |
+| `eaaec55ea49b7c0b650429164c7c15260487eb10` | Keyboard/controller social overlay |
+| `c202927a56215321064e98ccbd995533e3d7b2e8` | Overlay lifecycle and reentrancy hardening |
+| `40e76edc822c5880ad9f32b2daae69f15659751e` | Service-owned XDUI launcher |
+| `fb38a3f7ad6c9112e8779f7908ffdcc2b2468f30` | Keyring-free shared social protocol crate |
+
+The range also contains the initial maintainer documentation commit
+`966cb58586db725a1d1201a34457eb2e4a62f33f`; it is not a source change.
 
 ## Ownership and trust boundary
 
@@ -27,9 +45,16 @@ this Xodus branch.
 - validation and one-subscriber relay of invite activation URIs; and
 - discovery, single-instance launch, cancellation, and reaping of the overlay.
 
-`xodus-overlay` owns presentation and input only. It receives display labels,
-coarse presence, opaque handles, and fixed status text. It does not receive a
-raw XUID, authorization token, connection string, or activation URI.
+`xodus-social-protocol` owns only the redacted XDSO model and bounded framing.
+It depends directly on `serde`, `serde_json`, `thiserror`, `tokio`, and `uuid`.
+The `xodus` library re-exports this contract through the existing
+`xodus::forza::ipc::*` and `xodus::forza::{...}` public paths.
+
+`xodus-overlay` owns presentation and input only. It consumes
+`xodus-social-protocol` directly rather than the full `xodus` library, receives
+display labels, coarse presence, opaque handles, and fixed status text, and
+does not receive a raw XUID, authorization token, connection string, or
+activation URI.
 
 The service socket is created with mode `0600`. The router checks Unix peer
 credentials for the same UID before constructing a connection context or
@@ -43,7 +68,8 @@ All multibyte integer fields below are little-endian.
 
 ### XDSO — social request/response
 
-Each request and response is one bounded frame:
+`xodus-social-protocol` provides the shared model, encoder, reader, and
+serialized writer. Each request and response is one bounded frame:
 
 | Field | Width | Contract |
 | --- | ---: | --- |
@@ -126,8 +152,9 @@ game-facing bridge do not own credentials or transport identifiers.
 ## Overlay and input
 
 The overlay is a normal GTK4/libadwaita application window. SDL3 is linked
-dynamically through `pkg-config`; no vendored SDL build is enabled. The
-overlay/launcher adds no GNOME Keyring dependency, compositor command,
+dynamically through `pkg-config`; no vendored SDL build is enabled. The overlay
+dependency tree contains neither the full `xodus` crate nor a keyring or Secret
+Service backend. The overlay/launcher also adds no compositor command,
 layer-shell protocol, global input grab, Xbox RTA registration, or background
 friend/invite network polling.
 
@@ -173,9 +200,15 @@ service or overlay:
 cargo fmt --check
 cargo clippy --workspace --all-targets --offline -- -D warnings
 git diff --exit-code a92abacb0743f16c769279b9057c8c28435e5ef9..HEAD -- crates/xodus-cli/src/commands/streaming.rs
-cargo clippy -p xodus -p xodus-service -p xodus-overlay --all-targets --offline -- -D warnings
+! cargo tree -p xodus-overlay --offline | rg 'keyring|secret-service'
+! rg -n 'use xodus::|xodus::' crates/xodus-overlay
+cargo clippy -p xodus-social-protocol -p xodus -p xodus-service -p xodus-overlay --all-targets --offline -- -D warnings
+cargo test -p xodus-social-protocol --offline
+cargo test -p xodus --offline -- --skip test_get_xbox_live_dev_token
+cargo test -p xodus-service --offline
+cargo test -p xodus-overlay --offline
 cargo test --workspace --offline -- --skip test_get_xbox_live_dev_token
-cargo build --release --workspace --offline
+cargo build --release -p xodus-service -p xodus-overlay --offline
 rg -n 'Authorization:|XBL3\.0|ms-xbl-multiplayer://inviteAccept\?.+' docs crates || true
 git diff --check
 ```
@@ -187,12 +220,21 @@ Current results:
   unchanged `xodus-cli` streaming helpers have 11 and 10 arguments versus
   Clippy's default limit of 7. The base-to-tip diff for that file is empty; no
   suppression or out-of-scope source edit was made.
-- Strict all-target Clippy for `xodus`, `xodus-service`, and `xodus-overlay`:
-  **GREEN**, no issues.
-- Filtered workspace tests: **GREEN**, 85 passed, 1 ignored, 1 filtered out
-  across 14 suites. The filtered test is `test_get_xbox_live_dev_token`, an
+- The dependency-tree reproduction before extraction found
+  `dbus-secret-service-keyring-store`, `dbus-secret-service`, and
+  `keyring-core` below `xodus-overlay`. After extraction, both the dependency
+  scan and the overlay `xodus::` source scan return no matches: **GREEN**.
+- `xodus-social-protocol` has exactly five direct library dependencies:
+  `serde`, `serde_json`, `thiserror`, `tokio`, and `uuid`.
+- Strict all-target Clippy for `xodus-social-protocol`, `xodus`,
+  `xodus-service`, and `xodus-overlay`: **GREEN**, no issues.
+- Protocol compatibility tests: **GREEN**, 6 passed. They include a literal
+  version-1 `Snapshot` frame assertion in addition to the moved boundary and
+  concurrency tests.
+- Filtered workspace tests: **GREEN**, 86 passed, 1 ignored, 1 filtered out
+  across 16 suites. The filtered test is `test_get_xbox_live_dev_token`, an
   upstream anonymous live Microsoft test.
-- Offline release workspace build: **GREEN**, 505 crates compiled.
+- Offline release build for `xodus-service` and `xodus-overlay`: **GREEN**.
 - Privacy scan: 13 final-tree matches, all classified below; no live value.
 
 Privacy match classification:
