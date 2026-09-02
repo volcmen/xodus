@@ -105,33 +105,30 @@ where
         }
     }
 
-    async fn session_at(&mut self, now: i64) -> Result<&mut M::Session, BackendFailure> {
+    async fn take_session_at(&mut self, now: i64) -> Result<M::Session, BackendFailure> {
         let refresh_deadline = now.saturating_add(SESSION_REFRESH_MARGIN_SECONDS);
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|session| session.expires_at_or_before(refresh_deadline))
+        if let Some(session) = self.session.take()
+            && !session.expires_at_or_before(refresh_deadline)
         {
-            self.session = None;
+            return Ok(session);
         }
-        if self.session.is_none() {
-            self.session = Some(self.minter.mint().await?);
-        }
-        self.session.as_mut().ok_or(BackendFailure)
+        self.minter.mint().await
     }
 
     async fn refresh_friends_at(&mut self, now: i64) -> Result<Vec<XboxFriend>, BackendFailure> {
-        let result = self.session_at(now).await?.refresh_friends().await;
-        if result.is_err() {
-            self.session = None;
+        let mut session = self.take_session_at(now).await?;
+        let result = session.refresh_friends().await;
+        if result.is_ok() {
+            self.session = Some(session);
         }
         result
     }
 
     async fn invite_friend_at(&mut self, friend: &Xuid, now: i64) -> Result<(), BackendFailure> {
-        let result = self.session_at(now).await?.invite_friend(friend).await;
-        if result.is_err() {
-            self.session = None;
+        let mut session = self.take_session_at(now).await?;
+        let result = session.invite_friend(friend).await;
+        if result.is_ok() {
+            self.session = Some(session);
         }
         result
     }
@@ -141,9 +138,10 @@ where
         friend: &Xuid,
         now: i64,
     ) -> Result<InviteActivationUri, BackendFailure> {
-        let result = self.session_at(now).await?.join_friend(friend).await;
-        if result.is_err() {
-            self.session = None;
+        let mut session = self.take_session_at(now).await?;
+        let result = session.join_friend(friend).await;
+        if result.is_ok() {
+            self.session = Some(session);
         }
         result
     }
@@ -397,6 +395,7 @@ mod tests {
     enum FailingOperation {
         None,
         Refresh,
+        PendingRefresh,
         Invite,
         Join,
     }
@@ -422,6 +421,9 @@ mod tests {
 
         async fn refresh_friends(&mut self) -> Result<Vec<XboxFriend>, BackendFailure> {
             self.calls.lock().unwrap().refreshes += 1;
+            if self.failing_operation == FailingOperation::PendingRefresh {
+                pending::<()>().await;
+            }
             if self.failing_operation == FailingOperation::Refresh {
                 return Err(BackendFailure);
             }
@@ -609,6 +611,48 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.mints, 2);
         assert_eq!(calls.refreshes, 3);
+    }
+
+    #[tokio::test]
+    async fn social_backend_cancelled_operation_remints_on_the_next_call() {
+        let (mut backend, calls) = session_backend([
+            (1_000, FailingOperation::PendingRefresh),
+            (1_000, FailingOperation::None),
+        ]);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), backend.refresh_friends_at(0))
+                .await
+                .is_err()
+        );
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.mints, 1);
+            assert_eq!(calls.refreshes, 1);
+        }
+
+        let second =
+            tokio::time::timeout(Duration::from_millis(100), backend.refresh_friends_at(0)).await;
+        assert!(matches!(second, Ok(Ok(_))));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.mints, 2);
+        assert_eq!(calls.refreshes, 2);
+    }
+
+    #[tokio::test]
+    async fn social_backend_successful_operations_reuse_one_session() {
+        let (mut backend, calls) = session_backend([(1_000, FailingOperation::None)]);
+        let friend = Xuid::new(FRIEND_XUID).unwrap();
+
+        backend.refresh_friends_at(0).await.unwrap();
+        backend.invite_friend_at(&friend, 0).await.unwrap();
+        backend.join_friend_at(&friend, 0).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.mints, 1);
+        assert_eq!(calls.refreshes, 1);
+        assert_eq!(calls.invites, 1);
+        assert_eq!(calls.joins, 1);
     }
 
     #[tokio::test]
