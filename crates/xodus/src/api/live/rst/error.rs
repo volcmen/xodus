@@ -17,6 +17,8 @@ pub enum RSTError {
     MissingNonce,
     #[error("Unexpected error deriving hmac key")]
     HmacKey,
+    #[error("Unexpected RST response")]
+    UnexpectedResponse,
     #[error("The signature verification failed - {0}")]
     InvalidResponseSignature(String),
 }

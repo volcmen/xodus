@@ -72,11 +72,12 @@ pub async fn exchange_device_token(
 
     match envelope.body.body {
         soap::BodyContent::RequestSecurityTokenResponse(res) => Ok(*res),
-        soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection) => {
-            let token = collection.security_tokens.remove(0);
-            Ok(token)
-        }
-        b => unimplemented!("Exchange token supports only singular token right now {b:?}"),
+        soap::BodyContent::RequestSecurityTokenResponseCollection(collection) => collection
+            .security_tokens
+            .into_iter()
+            .next()
+            .ok_or(rst::RSTError::UnexpectedResponse),
+        _ => Err(rst::RSTError::UnexpectedResponse),
     }
 }
 
