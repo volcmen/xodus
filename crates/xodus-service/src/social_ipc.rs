@@ -340,6 +340,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use tokio::sync::mpsc::error::TryRecvError;
     use xodus::forza::{
         FriendHandle, InviteActivationUri, Presence, SocialRequest, SocialResponse, XboxFriend,
         Xuid,
@@ -353,6 +354,7 @@ mod tests {
 
     const FRIEND_XUID: &str = "2810999999999999";
     const ACTIVATION_URI: &str = "ms-xbl-multiplayer://inviteAccept?invitedUser=2810000000000000&sender=2810999999999999&connectionString=synthetic-connection-secret";
+    const PENDING_ACTIVATION_URI: &str = "ms-xbl-multiplayer://inviteAccept?invitedUser=2810000000000000&sender=2810999999999998&connectionString=synthetic-pending-session";
 
     #[derive(Default)]
     struct Calls {
@@ -782,5 +784,29 @@ mod tests {
             activations.try_recv().unwrap().expose_for_activation(),
             ACTIVATION_URI
         );
+    }
+
+    #[tokio::test]
+    async fn social_join_reports_failure_when_activation_queue_is_full() {
+        let (mut service, calls) = service();
+        let relay = InviteActivationRelay::default();
+        let (_subscription, mut activations) = relay.register().unwrap();
+        let pending = InviteActivationUri::parse(PENDING_ACTIVATION_URI).unwrap();
+        relay.publish(pending.clone()).unwrap();
+        let handle = snapshot_handle(service.handle(SocialRequest::RefreshFriends, &relay).await);
+
+        let response = service
+            .handle(SocialRequest::JoinFriend { friend: handle }, &relay)
+            .await;
+
+        assert_eq!(
+            response,
+            SocialResponse::Error {
+                message: "Game invite channel is unavailable".to_owned(),
+            }
+        );
+        assert_eq!(calls.lock().unwrap().joins.len(), 1);
+        assert_eq!(activations.try_recv().unwrap(), pending);
+        assert_eq!(activations.try_recv(), Err(TryRecvError::Empty));
     }
 }

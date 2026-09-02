@@ -8,12 +8,14 @@ use tokio_util::sync::CancellationToken;
 use xodus::forza::InviteActivationUri;
 
 pub(crate) const MAX_ACTIVATION_URI_BYTES: usize = 4 * 1024;
+// Keep at most one pending activation so a stalled subscriber cannot accumulate URIs.
+const SUBSCRIBER_QUEUE_CAPACITY: usize = 1;
 const PUBLISH_OK: u8 = 0;
 const PUBLISH_FAILED: u8 = 1;
 
 struct Subscriber {
     id: u64,
-    sender: mpsc::UnboundedSender<InviteActivationUri>,
+    sender: mpsc::Sender<InviteActivationUri>,
 }
 
 #[derive(Default)]
@@ -29,7 +31,10 @@ pub(crate) struct InviteActivationRelay {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum PublishError {
+    InvalidLength,
     NoSubscriber,
+    Closed,
+    Full,
 }
 
 #[derive(Debug)]
@@ -48,27 +53,33 @@ impl std::error::Error for SubscribeError {}
 impl InviteActivationRelay {
     pub(crate) fn register(
         &self,
-    ) -> Result<(u64, mpsc::UnboundedReceiver<InviteActivationUri>), SubscribeError> {
+    ) -> Result<(u64, mpsc::Receiver<InviteActivationUri>), SubscribeError> {
         let mut subscriber = self.inner.subscriber.lock().expect("activation relay lock");
         if subscriber.is_some() {
             return Err(SubscribeError::AlreadyRegistered);
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
         *subscriber = Some(Subscriber { id, sender });
         Ok((id, receiver))
     }
 
     pub(crate) fn publish(&self, uri: InviteActivationUri) -> Result<(), PublishError> {
+        if !(1..=MAX_ACTIVATION_URI_BYTES).contains(&uri.expose_for_activation().len()) {
+            return Err(PublishError::InvalidLength);
+        }
         let mut subscriber = self.inner.subscriber.lock().expect("activation relay lock");
         let Some(active) = subscriber.as_ref() else {
             return Err(PublishError::NoSubscriber);
         };
-        if active.sender.send(uri).is_err() {
-            *subscriber = None;
-            return Err(PublishError::NoSubscriber);
+        match active.sender.try_send(uri) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(PublishError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                *subscriber = None;
+                Err(PublishError::Closed)
+            }
         }
-        Ok(())
     }
 
     fn unregister(&self, id: u64) {
@@ -152,14 +163,25 @@ pub(crate) async fn handle_publisher(
 #[cfg(test)]
 mod tests {
     use super::{
-        InviteActivationRelay, MAX_ACTIVATION_URI_BYTES, handle_publisher, handle_subscriber,
+        InviteActivationRelay, MAX_ACTIVATION_URI_BYTES, PublishError, handle_publisher,
+        handle_subscriber,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
+    use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::sync::CancellationToken;
     use xodus::forza::InviteActivationUri;
 
     const VALID_URI: &str = "ms-xbl-multiplayer://inviteAccept?invitedUser=2810000000000000&sender=2810000000000001&connectionString=synthetic-session";
+
+    fn activation_uri_with_length(length: usize, fill: char) -> InviteActivationUri {
+        const PREFIX: &str = "ms-xbl-multiplayer://inviteAccept?invitedUser=2810000000000000&sender=2810000000000001&connectionString=";
+        assert!(length > PREFIX.len());
+        let value = format!("{PREFIX}{}", fill.to_string().repeat(length - PREFIX.len()));
+        let uri = InviteActivationUri::parse(&value).unwrap();
+        assert_eq!(uri.expose_for_activation().len(), length);
+        uri
+    }
 
     async fn wait_for_subscriber(relay: &InviteActivationRelay) {
         for _ in 0..100 {
@@ -181,6 +203,50 @@ mod tests {
 
         assert_eq!(client.read_u8().await.unwrap(), 1);
         task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn invite_activation_publish_enforces_internal_uri_length_before_enqueue() {
+        let relay = InviteActivationRelay::default();
+        let (_subscription, mut activations) = relay.register().unwrap();
+        let oversized = activation_uri_with_length(MAX_ACTIVATION_URI_BYTES + 1, 'o');
+
+        assert_eq!(relay.publish(oversized), Err(PublishError::InvalidLength));
+        assert_eq!(activations.try_recv(), Err(TryRecvError::Empty));
+
+        let boundary = activation_uri_with_length(MAX_ACTIVATION_URI_BYTES, 'b');
+        relay.publish(boundary.clone()).unwrap();
+        assert_eq!(activations.try_recv().unwrap(), boundary);
+    }
+
+    #[test]
+    fn invite_activation_full_queue_preserves_subscriber_and_recovers() {
+        let relay = InviteActivationRelay::default();
+        let (_subscription, mut activations) = relay.register().unwrap();
+        let first = InviteActivationUri::parse(VALID_URI).unwrap();
+        let second = activation_uri_with_length(VALID_URI.len(), 'r');
+
+        relay.publish(first.clone()).unwrap();
+        assert_eq!(relay.publish(second.clone()), Err(PublishError::Full));
+        assert!(relay.has_subscriber());
+        assert_eq!(activations.try_recv().unwrap(), first);
+        assert_eq!(activations.try_recv(), Err(TryRecvError::Empty));
+
+        relay.publish(second.clone()).unwrap();
+        assert_eq!(activations.try_recv().unwrap(), second);
+    }
+
+    #[test]
+    fn invite_activation_closed_subscriber_is_distinct_and_removed() {
+        let relay = InviteActivationRelay::default();
+        let (_subscription, activations) = relay.register().unwrap();
+        drop(activations);
+
+        assert_eq!(
+            relay.publish(InviteActivationUri::parse(VALID_URI).unwrap()),
+            Err(PublishError::Closed)
+        );
+        assert!(!relay.has_subscriber());
     }
 
     #[tokio::test]

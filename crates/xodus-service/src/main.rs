@@ -1,6 +1,8 @@
 use std::fs::Permissions;
+use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::net::UnixListener;
@@ -17,6 +19,27 @@ mod utils;
 
 const XML_MAGIC: u32 = 0x58445358;
 const PROTO_MAGIC: u32 = 0x58445350;
+
+fn restrict_socket_permissions(path: &Path) -> io::Result<()> {
+    std::fs::set_permissions(path, Permissions::from_mode(0o600))
+}
+
+fn bind_private_socket(path: &Path) -> io::Result<UnixListener> {
+    let listener = UnixListener::bind(path)?;
+    if let Err(permission_error) = restrict_socket_permissions(path) {
+        drop(listener);
+        std::fs::remove_file(path).map_err(|cleanup_error| {
+            io::Error::new(
+                cleanup_error.kind(),
+                format!(
+                    "failed to restrict socket permissions ({permission_error}); cleanup failed ({cleanup_error})"
+                ),
+            )
+        })?;
+        return Err(permission_error);
+    }
+    Ok(listener)
+}
 
 #[tokio::main]
 async fn main() {
@@ -41,13 +64,11 @@ async fn main() {
         trigger.cancel();
     });
     {
-        let listener = UnixListener::bind(&socket_path).expect("Unable to bind to socket");
+        let listener = bind_private_socket(Path::new(&socket_path))
+            .expect("Unable to bind a private service socket");
         let service_uid = std::fs::metadata(&socket_path)
             .expect("Unable to inspect socket owner")
             .uid();
-        let mode = 0o600;
-        let perms = Permissions::from_mode(mode);
-        _ = tokio::fs::set_permissions(&socket_path, perms).await;
         let activations = invite_activation::InviteActivationRelay::default();
         let social = Arc::new(Mutex::new(social_ipc::SocialService::new(
             social_ipc::ForzaBackend::new(Arc::clone(&tokens)),
@@ -79,4 +100,29 @@ async fn main() {
     }
 
     _ = tokio::fs::remove_file(socket_path).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::tempdir;
+
+    use super::restrict_socket_permissions;
+
+    #[test]
+    fn invite_activation_socket_permissions_are_exactly_0600() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("synthetic.sock");
+        fs::write(&path, b"synthetic").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
+        restrict_socket_permissions(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
