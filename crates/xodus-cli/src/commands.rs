@@ -1,6 +1,7 @@
 pub mod clep;
 pub mod download;
 pub mod extract;
+pub mod forza;
 pub mod license;
 pub mod login;
 #[cfg(unix)]

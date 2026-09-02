@@ -68,7 +68,6 @@ pub async fn refresh_tokens(
     Ok(ts)
 }
 
-
 /// Load the proof key this service should mint with, from XODUS_PROOF_KEY.
 ///
 /// WHY. An XSTS token is bound to the proof key advertised when it was minted,
@@ -85,7 +84,11 @@ pub async fn refresh_tokens(
 const PROOF_KEY_ENTRY: &str = "proof_key";
 
 fn key_from_hex_line(text: &str, what: &str) -> Option<xal::SecretKey> {
-    let d = text.lines().map(str::trim).filter(|l| !l.is_empty()).nth(2)?;
+    let d = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .nth(2)?;
     let bytes = (0..d.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&d[i..i + 2], 16))
@@ -154,11 +157,7 @@ pub fn service_proof_key_xyd() -> Option<(String, String, String)> {
     let key = service_proof_key()?;
     let point = key.public_key().to_encoded_point(false);
     let hex = |b: &[u8]| b.iter().map(|c| format!("{c:02x}")).collect::<String>();
-    Some((
-        hex(point.x()?),
-        hex(point.y()?),
-        hex(&key.to_bytes()),
-    ))
+    Some((hex(point.x()?), hex(point.y()?), hex(&key.to_bytes())))
 }
 
 fn host_request_signer() -> Option<xal::RequestSigner> {
@@ -367,19 +366,34 @@ async fn test_forza_xsts_with_title_token() {
     let (_, resp, _) = do_sisu(&client, &tokens, "000000004CC9D265", 1842668909)
         .await
         .expect("sisu");
-    println!("FM-XSTS: sisu ok, title={} user={}",
-             resp.title_token.token.len(), resp.user_token.token.len());
-    println!("FM-XSTS: sisu authorization_token uhs = {}",
-             resp.authorization_token.userhash());
+    println!(
+        "FM-XSTS: sisu ok, title={} user={}",
+        resp.title_token.token.len(),
+        resp.user_token.token.len()
+    );
+    println!(
+        "FM-XSTS: sisu authorization_token uhs = {}",
+        resp.authorization_token.userhash()
+    );
 
-    for rp in ["http://xboxliveauth.forzamotorsport.net/", "http://xboxlive.com"] {
+    for rp in [
+        "http://xboxliveauth.forzamotorsport.net/",
+        "http://xboxlive.com",
+    ] {
         match get_xsts_token(None, Some(&resp.title_token), Some(&resp.user_token), rp).await {
             Ok(x) => {
-                println!("FM-XSTS: {rp} -> uhs {} tokenlen {}", x.userhash(), x.token.len());
+                println!(
+                    "FM-XSTS: {rp} -> uhs {} tokenlen {}",
+                    x.userhash(),
+                    x.token.len()
+                );
                 if rp.contains("forzamotorsport") {
                     let hdr = format!("XBL3.0 x={};{}", x.userhash(), x.token);
                     std::fs::write("/tmp/fm_title_xsts.txt", &hdr).expect("write");
-                    println!("FM-XSTS: header written to /tmp/fm_title_xsts.txt ({} chars)", hdr.len());
+                    println!(
+                        "FM-XSTS: header written to /tmp/fm_title_xsts.txt ({} chars)",
+                        hdr.len()
+                    );
                 }
             }
             Err(e) => println!("FM-XSTS: {rp} -> FAILED {e:?}"),
@@ -398,8 +412,8 @@ async fn test_forza_title_endpoints() {
 
     // keep the authenticator — you threw it away as `_` before, and it holds the signer
     let (auth, resp, _) = do_sisu(&client, &tokens, "000000004CC9D265", 1842668909)
-    .await
-    .expect("SISU failed");
+        .await
+        .expect("SISU failed");
 
     println!("uhs        = {}", resp.authorization_token.userhash());
     println!("xsts expiry= {}", resp.authorization_token.not_after);
@@ -408,17 +422,17 @@ async fn test_forza_title_endpoints() {
     let mut signer = auth.request_signer();
 
     let response = client
-    .get("https://title.mgt.xboxlive.com/titles/current/endpoints")
-    .query(&[("type", "1")])
-    .header("Authorization", &auth_header)
-    .header("x-xbl-contract-version", "1")
-    .header("Accept", "application/json")
-    .sign(&mut signer, None)
-    .await
-    .expect("failed to sign request")
-    .send()
-    .await
-    .expect("request failed");
+        .get("https://title.mgt.xboxlive.com/titles/current/endpoints")
+        .query(&[("type", "1")])
+        .header("Authorization", &auth_header)
+        .header("x-xbl-contract-version", "1")
+        .header("Accept", "application/json")
+        .sign(&mut signer, None)
+        .await
+        .expect("failed to sign request")
+        .send()
+        .await
+        .expect("request failed");
 
     println!("STATUS: {}", response.status());
     for (k, v) in response.headers() {
@@ -444,22 +458,40 @@ async fn test_forza_xsts_full_chain() {
     let (mut auth, resp, _) = do_sisu(&client, &tokens, "000000004CC9D265", 1842668909)
         .await
         .expect("sisu");
-    println!("FM-FULL: sisu ok (title {} chars)", resp.title_token.token.len());
+    println!(
+        "FM-FULL: sisu ok (title {} chars)",
+        resp.title_token.token.len()
+    );
 
     let xad = auth.get_device_token().await.expect("device token");
     println!("FM-FULL: device token ok ({} chars)", xad.token.len());
 
-    for rp in ["http://xboxliveauth.forzamotorsport.net/", "http://xboxlive.com"] {
+    for rp in [
+        "http://xboxliveauth.forzamotorsport.net/",
+        "http://xboxlive.com",
+    ] {
         match auth
-            .get_xsts_token(Some(&xad), Some(&resp.title_token), Some(&resp.user_token), rp)
+            .get_xsts_token(
+                Some(&xad),
+                Some(&resp.title_token),
+                Some(&resp.user_token),
+                rp,
+            )
             .await
         {
             Ok(x) => {
-                println!("FM-FULL: {rp}\n         uhs {}  tokenlen {}", x.userhash(), x.token.len());
+                println!(
+                    "FM-FULL: {rp}\n         uhs {}  tokenlen {}",
+                    x.userhash(),
+                    x.token.len()
+                );
                 if rp.contains("forzamotorsport") {
                     let hdr = format!("XBL3.0 x={};{}", x.userhash(), x.token);
                     std::fs::write("/tmp/fm_title_xsts.txt", &hdr).expect("write");
-                    println!("         header -> /tmp/fm_title_xsts.txt ({} chars)", hdr.len());
+                    println!(
+                        "         header -> /tmp/fm_title_xsts.txt ({} chars)",
+                        hdr.len()
+                    );
                 }
             }
             Err(e) => println!("FM-FULL: {rp} -> FAILED {e:?}"),
@@ -488,16 +520,32 @@ async fn test_forza_xsts_one_device() {
     let (mut auth, resp, device) = do_sisu(&client, &tokens, "000000004CC9D265", 1842668909)
         .await
         .expect("sisu");
-    println!("FM-ONE: sisu ok - title {} user {} device {} (the SISU device)",
-             resp.title_token.token.len(), resp.user_token.token.len(), device.token.len());
+    println!(
+        "FM-ONE: sisu ok - title {} user {} device {} (the SISU device)",
+        resp.title_token.token.len(),
+        resp.user_token.token.len(),
+        device.token.len()
+    );
 
-    for rp in ["http://xboxliveauth.forzamotorsport.net/", "http://xboxlive.com"] {
+    for rp in [
+        "http://xboxliveauth.forzamotorsport.net/",
+        "http://xboxlive.com",
+    ] {
         match auth
-            .get_xsts_token(Some(&device), Some(&resp.title_token), Some(&resp.user_token), rp)
+            .get_xsts_token(
+                Some(&device),
+                Some(&resp.title_token),
+                Some(&resp.user_token),
+                rp,
+            )
             .await
         {
             Ok(x) => {
-                println!("FM-ONE: {rp}\n        uhs {}  tokenlen {}", x.userhash(), x.token.len());
+                println!(
+                    "FM-ONE: {rp}\n        uhs {}  tokenlen {}",
+                    x.userhash(),
+                    x.token.len()
+                );
                 let hdr = format!("XBL3.0 x={};{}", x.userhash(), x.token);
                 let path = if rp.contains("forzamotorsport") {
                     "/tmp/fm_title_xsts.txt"

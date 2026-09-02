@@ -39,6 +39,43 @@ enum SubCommand {
         market: Option<String>,
     },
     Login,
+    #[command(about = "Send a cross-platform Forza Motorsport invite through Xbox Live")]
+    ForzaInvite {
+        #[arg(help = "Xbox gamertag or XUID; omit to choose interactively")]
+        friend: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "friend",
+            help = "Choose an Xbox friend with fuzzel"
+        )]
+        fuzzel: bool,
+        #[arg(
+            long,
+            help = "Verify the friend and current activity without sending an invite"
+        )]
+        dry_run: bool,
+    },
+    #[command(about = "Join an Xbox friend's published Forza Motorsport session")]
+    ForzaJoin {
+        #[arg(help = "Xbox gamertag or XUID; omit to choose interactively")]
+        friend: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "friend",
+            help = "Choose an Xbox friend with fuzzel"
+        )]
+        fuzzel: bool,
+        #[arg(
+            long,
+            help = "Verify that the friend has a joinable activity without joining"
+        )]
+        dry_run: bool,
+    },
+    #[command(about = "Open one menu for Forza Xbox invite and join actions")]
+    ForzaSocial {
+        #[arg(long, help = "Use fuzzel for action and friend selection")]
+        fuzzel: bool,
+    },
     #[command(about = "Download and extract the game through streaming algorithm")]
     Streaming {
         source: String,
@@ -141,6 +178,19 @@ async fn main() -> ExitCode {
             .await
         }
         SubCommand::Login => commands::login::run(&client, &tokens).await,
+        SubCommand::ForzaInvite {
+            friend,
+            fuzzel,
+            dry_run,
+        } => commands::forza::run(&client, &tokens, friend.as_deref(), fuzzel, dry_run).await,
+        SubCommand::ForzaJoin {
+            friend,
+            fuzzel,
+            dry_run,
+        } => commands::forza::run_join(&client, &tokens, friend.as_deref(), fuzzel, dry_run).await,
+        SubCommand::ForzaSocial { fuzzel } => {
+            commands::forza::run_social(&client, &tokens, fuzzel).await
+        }
         SubCommand::Extract {
             path,
             destination,

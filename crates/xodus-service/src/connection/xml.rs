@@ -69,7 +69,9 @@ pub async fn parse_message(
             let title_id: i64 = req.title_id.parse().unwrap_or(0);
             log::debug!(
                 "XSTS request: rp={} client={} title={}",
-                req.relying_party, req.client_id, title_id
+                req.relying_party,
+                req.client_id,
+                title_id
             );
 
             // do_sisu returns the device token it was authorized with - use THAT.
@@ -78,9 +80,7 @@ pub async fn parse_message(
                     .await
                     // do_sisu's error is a bare Box<dyn Error>; this handler must
                     // return one that is Send + Sync, so carry the text across.
-                    .map_err(|e| {
-                        std::io::Error::other(format!("sisu failed: {e}"))
-                    })?;
+                    .map_err(|e| std::io::Error::other(format!("sisu failed: {e}")))?;
             let xsts = auth
                 .get_xsts_token(
                     Some(&device),

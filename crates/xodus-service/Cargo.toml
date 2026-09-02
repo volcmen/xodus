@@ -13,3 +13,11 @@ log = "0.4.28"
 env_logger = "0.11.8"
 tokio-util = "0.7.18"
 serde_json = "1.0.145"
+url = { workspace = true }
+serde = { version = "1.0.228", features = ["derive"] }
+uuid = { version = "1.23.1", features = ["v4", "serde"] }
+thiserror = "2.0.18"
+futures-util = "0.3.32"
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }

@@ -1,0 +1,48 @@
+.forza-social-window {
+  background: linear-gradient(145deg, #10151d, #171d28);
+}
+
+.social-list {
+  margin: 24px 34px;
+  border-radius: 14px;
+  background: alpha(#0b0f15, 0.72);
+}
+
+.social-list row {
+  border-bottom: 1px solid alpha(white, 0.08);
+}
+
+.social-list row:selected {
+  background: linear-gradient(90deg, #087ea4, #0d5d81);
+}
+
+.social-list row.invitation {
+  box-shadow: inset 4px 0 #56d2ff;
+}
+
+.social-title {
+  font-weight: 700;
+  font-size: 1.12em;
+}
+
+.social-subtitle {
+  opacity: 0.72;
+}
+
+.row-action,
+.status-pill {
+  font-weight: 700;
+  opacity: 0.88;
+}
+
+.status-pill {
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: alpha(#56d2ff, 0.16);
+}
+
+.controls-hint {
+  padding: 14px 24px 18px;
+  opacity: 0.7;
+  font-size: 0.9em;
+}
