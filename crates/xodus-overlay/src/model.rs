@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use xodus::forza::{SocialFriend, SocialPresence, SocialRequest, SocialResponse};
+use xodus_social_protocol::{SocialFriend, SocialPresence, SocialRequest, SocialResponse};
 
 use crate::action::UiAction;
 

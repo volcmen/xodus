@@ -7249,6 +7249,7 @@ dependencies = [
  "url",
  "uuid",
  "xal",
+ "xodus-social-protocol",
  "zerocopy",
 ]
 
@@ -7289,7 +7290,7 @@ dependencies = [
  "sdl3",
  "thiserror 2.0.20",
  "tokio",
- "xodus",
+ "xodus-social-protocol",
 ]
 
 [[package]]
@@ -7306,6 +7307,17 @@ dependencies = [
  "tokio",
  "tokio-util",
  "xodus",
+]
+
+[[package]]
+name = "xodus-social-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

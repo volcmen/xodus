@@ -7,16 +7,16 @@ use std::thread;
 use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt, split};
-use xodus::forza::ipc::{encode_frame, read_frame};
-use xodus::forza::{
-    FriendHandle, SocialFriend, SocialPresence, SocialRequest, SocialResponse, SocialSnapshot,
-};
 use xodus_overlay::action::{GamepadButton, GamepadInput, InputMapper, KeyInput, UiAction};
 use xodus_overlay::client::{ClientError, ClientWorker, SocialClient};
 use xodus_overlay::controller::{ControllerDeviceEvent, ControllerInputState, ControllerState};
 use xodus_overlay::model::{
     ModelEffect, OverlayModel, UiOutcome, ViewKind, with_action_effect, with_detached_view,
     with_response_effect,
+};
+use xodus_social_protocol::{
+    FriendHandle, SocialFriend, SocialPresence, SocialRequest, SocialResponse, SocialSnapshot,
+    encode_frame, read_frame,
 };
 
 fn friend(label: &str, presence: SocialPresence) -> SocialFriend {

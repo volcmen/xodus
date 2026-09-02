@@ -9,4 +9,4 @@ gtk = { package = "gtk4", version = "0.11.4" }
 sdl3 = { version = "0.18.4", features = ["use-pkg-config"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-xodus = { path = "../xodus" }
+xodus-social-protocol = { path = "../xodus-social-protocol" }

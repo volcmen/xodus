@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::gdk;
-use xodus::forza::SocialPresence;
+use xodus_social_protocol::SocialPresence;
 
 use crate::action::{InputMapper, KeyInput, UiAction};
 use crate::client::ClientWorker;

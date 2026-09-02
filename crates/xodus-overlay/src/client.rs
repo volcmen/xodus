@@ -8,8 +8,9 @@ use thiserror::Error;
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, watch};
-use xodus::forza::ipc::{FrameWriter, ProtocolError, read_frame};
-use xodus::forza::{SocialRequest, SocialResponse};
+use xodus_social_protocol::{
+    FrameWriter, ProtocolError, SocialRequest, SocialResponse, read_frame,
+};
 
 struct Transport {
     reader: OwnedReadHalf,

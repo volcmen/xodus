@@ -1,8 +1,17 @@
 use std::io::Cursor;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use xodus::forza::ipc::{FrameWriter, ProtocolError, decode_frame, encode_frame, read_frame};
-use xodus::forza::{FriendHandle, SocialRequest};
+use xodus_social_protocol::{
+    FrameWriter, FriendHandle, ProtocolError, SocialRequest, decode_frame, encode_frame, read_frame,
+};
+
+#[test]
+fn snapshot_frame_keeps_the_version_one_wire_representation() {
+    assert_eq!(
+        encode_frame(&SocialRequest::Snapshot).unwrap(),
+        b"XDSO\x01\x00\x0a\x00\x00\x00\"Snapshot\""
+    );
+}
 
 #[test]
 fn social_frames_round_trip_with_version_one() {
