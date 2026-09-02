@@ -4,6 +4,13 @@ use xodus_social_protocol::{SocialFriend, SocialPresence, SocialRequest, SocialR
 
 use crate::action::UiAction;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UiMode {
+    #[default]
+    Full,
+    InviteOnly,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewKind {
     Loading,
@@ -46,6 +53,7 @@ pub struct RenderedView {
     pub selected: Option<usize>,
     pub status: String,
     pub busy: bool,
+    pub allow_join: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,13 +63,22 @@ pub enum ModelEffect {
     Close(UiOutcome),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingRequest {
+    Refresh,
+    Invite,
+    Join,
+}
+
 pub struct OverlayModel {
+    mode: UiMode,
     friends: Vec<SocialFriend>,
     selected: Option<usize>,
     kind: ViewKind,
     status: String,
     outcome: UiOutcome,
     request_in_flight: bool,
+    pending_request: Option<PendingRequest>,
 }
 
 pub fn with_detached_view<T>(
@@ -99,13 +116,20 @@ impl Default for OverlayModel {
 impl OverlayModel {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_mode(UiMode::Full)
+    }
+
+    #[must_use]
+    pub fn with_mode(mode: UiMode) -> Self {
         Self {
+            mode,
             friends: Vec::new(),
             selected: None,
             kind: ViewKind::Loading,
             status: "Loading friends".to_owned(),
             outcome: UiOutcome::Pending,
             request_in_flight: true,
+            pending_request: Some(PendingRequest::Refresh),
         }
     }
 
@@ -134,6 +158,7 @@ impl OverlayModel {
             selected: self.selected,
             status: self.status.clone(),
             busy: self.request_in_flight,
+            allow_join: self.mode == UiMode::Full,
         }
     }
 
@@ -143,6 +168,7 @@ impl OverlayModel {
 
     pub fn apply_response(&mut self, response: SocialResponse) -> ModelEffect {
         self.request_in_flight = false;
+        let pending_request = self.pending_request.take();
         match response {
             SocialResponse::Snapshot(snapshot) => {
                 self.friends = snapshot.friends;
@@ -162,6 +188,15 @@ impl OverlayModel {
                 ModelEffect::None
             }
             SocialResponse::Success { .. } => {
+                let completed_action = matches!(pending_request, Some(PendingRequest::Invite))
+                    || (self.mode == UiMode::Full
+                        && matches!(pending_request, Some(PendingRequest::Join)));
+                if !completed_action {
+                    self.kind = ViewKind::Error;
+                    self.status = "Unexpected service response".to_owned();
+                    self.outcome = UiOutcome::Failed;
+                    return ModelEffect::None;
+                }
                 self.kind = ViewKind::Success;
                 self.status = "Action completed".to_owned();
                 self.outcome = UiOutcome::Completed;
@@ -183,6 +218,7 @@ impl OverlayModel {
 
     pub fn request_failed(&mut self) {
         self.request_in_flight = false;
+        self.pending_request = None;
         self.kind = ViewKind::Error;
         self.status = "Unable to start request".to_owned();
     }
@@ -218,16 +254,20 @@ impl OverlayModel {
                 self.kind = ViewKind::Loading;
                 self.status = "Refreshing friends".to_owned();
                 self.request_in_flight = true;
+                self.pending_request = Some(PendingRequest::Refresh);
                 self.outcome = UiOutcome::Pending;
                 ModelEffect::Request(SocialRequest::RefreshFriends)
             }
             UiAction::Invite => self.selected_request(false),
+            UiAction::Join if self.mode == UiMode::InviteOnly => ModelEffect::None,
             UiAction::Join => self.selected_request(true),
             UiAction::Activate => {
                 let Some(friend) = self.selected_friend() else {
                     return self.no_selection();
                 };
-                self.selected_request(matches!(friend.presence, SocialPresence::Online))
+                self.selected_request(
+                    self.mode == UiMode::Full && matches!(friend.presence, SocialPresence::Online),
+                )
             }
         }
     }
@@ -262,6 +302,11 @@ impl OverlayModel {
             }
         };
         self.request_in_flight = true;
+        self.pending_request = Some(if join {
+            PendingRequest::Join
+        } else {
+            PendingRequest::Invite
+        });
         self.status = if join {
             "Joining friend".to_owned()
         } else {

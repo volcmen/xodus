@@ -11,6 +11,31 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+pub(crate) const SOCIAL_UI_ACCEPTED: u8 = 0xa1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SocialUiMode {
+    Full,
+    InviteOnly,
+}
+
+impl SocialUiMode {
+    pub(crate) fn from_request(request: [u8; 2]) -> Option<Self> {
+        match request {
+            [1, 0] => Some(Self::Full),
+            [1, 1] => Some(Self::InviteOnly),
+            _ => None,
+        }
+    }
+
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::InviteOnly => "invite-only",
+        }
+    }
+}
+
 pub struct SocialUiLauncher {
     path: Option<PathBuf>,
     gate: Arc<Mutex<()>>,
@@ -44,6 +69,7 @@ impl SocialUiLauncher {
         &self,
         socket: &mut UnixStream,
         cancellation: &CancellationToken,
+        mode: SocialUiMode,
     ) -> std::io::Result<()> {
         let Ok(_guard) = Arc::clone(&self.gate).try_lock_owned() else {
             return write_status(socket, 2).await;
@@ -55,13 +81,17 @@ impl SocialUiLauncher {
             log::warn!("Social UI path resolution failed");
             return write_status(socket, 2).await;
         };
-        let mut child = match tokio::process::Command::from(overlay_command(path)).spawn() {
+        let mut child = match tokio::process::Command::from(overlay_command(path, mode)).spawn() {
             Ok(child) => child,
             Err(_) => {
                 log::warn!("Social UI process spawn failed");
                 return write_status(socket, 2).await;
             }
         };
+        if let Err(error) = socket.write_all(&[SOCIAL_UI_ACCEPTED]).await {
+            terminate_and_reap(&mut child).await;
+            return Err(error);
+        }
 
         let mut peer_byte = [0_u8; 1];
         let status = tokio::select! {
@@ -126,8 +156,10 @@ where
     }
 }
 
-pub(crate) fn overlay_command(path: &Path) -> Command {
-    Command::new(path)
+pub(crate) fn overlay_command(path: &Path, mode: SocialUiMode) -> Command {
+    let mut command = Command::new(path);
+    command.arg("--mode").arg(mode.argument());
+    command
 }
 
 #[cfg(test)]
@@ -144,12 +176,15 @@ mod tests {
     use std::time::Duration;
 
     use tempfile::TempDir;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use tokio::time::{sleep, timeout};
     use tokio_util::sync::CancellationToken;
 
-    use super::{SocialUiLauncher, overlay_command, resolve_overlay_path, sibling_overlay_path};
+    use super::{
+        SOCIAL_UI_ACCEPTED, SocialUiLauncher, SocialUiMode, overlay_command, resolve_overlay_path,
+        sibling_overlay_path, terminate_and_reap, write_status,
+    };
 
     static HELPER_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -237,10 +272,10 @@ mod tests {
         PathBuf::from(format!("/proc/{pid}")).exists()
     }
 
-    async fn served_response(launcher: &SocialUiLauncher) -> Vec<u8> {
+    async fn served_response(launcher: &SocialUiLauncher, mode: SocialUiMode) -> Vec<u8> {
         let cancellation = CancellationToken::new();
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        let serve = launcher.serve(&mut server, &cancellation);
+        let serve = launcher.serve(&mut server, &cancellation, mode);
         let read = async {
             let mut response = Vec::new();
             client.read_to_end(&mut response).await.unwrap();
@@ -255,8 +290,12 @@ mod tests {
     async fn successful_overlay_writes_exactly_completed_status() {
         let helper = helper("exit 0");
         assert_eq!(
-            served_response(&SocialUiLauncher::from_path(helper.path.clone())).await,
-            [0]
+            served_response(
+                &SocialUiLauncher::from_path(helper.path.clone()),
+                SocialUiMode::Full,
+            )
+            .await,
+            [SOCIAL_UI_ACCEPTED, 0]
         );
     }
 
@@ -271,8 +310,12 @@ mod tests {
         ] {
             let helper = helper(body);
             assert_eq!(
-                served_response(&SocialUiLauncher::from_path(helper.path.clone())).await,
-                [expected],
+                served_response(
+                    &SocialUiLauncher::from_path(helper.path.clone()),
+                    SocialUiMode::Full,
+                )
+                .await,
+                [SOCIAL_UI_ACCEPTED, expected],
                 "helper body: {body}"
             );
         }
@@ -282,16 +325,21 @@ mod tests {
     async fn missing_or_non_executable_overlay_maps_to_failure_without_panicking() {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(
-            served_response(&SocialUiLauncher::from_path(
-                directory.path().join("missing-overlay")
-            ))
+            served_response(
+                &SocialUiLauncher::from_path(directory.path().join("missing-overlay")),
+                SocialUiMode::Full,
+            )
             .await,
             [2]
         );
 
         let helper = helper_with_mode("exit 0", 0o600);
         assert_eq!(
-            served_response(&SocialUiLauncher::from_path(helper.path.clone())).await,
+            served_response(
+                &SocialUiLauncher::from_path(helper.path.clone()),
+                SocialUiMode::Full,
+            )
+            .await,
             [2]
         );
     }
@@ -324,11 +372,16 @@ mod tests {
     }
 
     #[test]
-    fn overlay_command_has_zero_arguments_and_no_explicit_environment() {
-        let command = overlay_command(Path::new("/opt/xodus/xodus-overlay"));
-        assert_eq!(command.get_program(), "/opt/xodus/xodus-overlay");
-        assert_eq!(command.get_args().count(), 0);
-        assert_eq!(command.get_envs().count(), 0);
+    fn overlay_command_uses_only_the_fixed_mode_argument_and_no_explicit_environment() {
+        for (mode, expected) in [
+            (SocialUiMode::Full, "full"),
+            (SocialUiMode::InviteOnly, "invite-only"),
+        ] {
+            let command = overlay_command(Path::new("/opt/xodus/xodus-overlay"), mode);
+            assert_eq!(command.get_program(), "/opt/xodus/xodus-overlay");
+            assert_eq!(command.get_args().collect::<Vec<_>>(), ["--mode", expected]);
+            assert_eq!(command.get_envs().count(), 0);
+        }
     }
 
     #[tokio::test]
@@ -341,7 +394,11 @@ mod tests {
         let (mut first_client, mut first_server) = UnixStream::pair().unwrap();
         let first = tokio::spawn(async move {
             first_launcher
-                .serve(&mut first_server, &first_task_cancellation)
+                .serve(
+                    &mut first_server,
+                    &first_task_cancellation,
+                    SocialUiMode::Full,
+                )
                 .await
         });
         wait_for_file(&pid).await;
@@ -351,7 +408,11 @@ mod tests {
         let second_launcher = Arc::clone(&launcher);
         let second = tokio::spawn(async move {
             second_launcher
-                .serve(&mut second_server, &second_cancellation)
+                .serve(
+                    &mut second_server,
+                    &second_cancellation,
+                    SocialUiMode::InviteOnly,
+                )
                 .await
         });
         let mut second_response = Vec::new();
@@ -383,8 +444,11 @@ mod tests {
         let task_cancellation = cancellation.clone();
         let task_launcher = Arc::clone(&launcher);
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        let mut task =
-            tokio::spawn(async move { task_launcher.serve(&mut server, &task_cancellation).await });
+        let mut task = tokio::spawn(async move {
+            task_launcher
+                .serve(&mut server, &task_cancellation, SocialUiMode::Full)
+                .await
+        });
         wait_for_file(&pid_path).await;
         let pid = recorded_pid(&pid_path);
 
@@ -400,13 +464,13 @@ mod tests {
         prompt.unwrap().unwrap().unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
-        assert_eq!(response, [2]);
+        assert_eq!(response, [SOCIAL_UI_ACCEPTED, 2]);
         assert!(!process_exists(pid), "cancelled child must be reaped");
 
         write_helper_file(&helper_path, "exit 0", 0o700);
         assert_eq!(
-            served_response(&launcher).await,
-            [0],
+            served_response(&launcher, SocialUiMode::Full).await,
+            [SOCIAL_UI_ACCEPTED, 0],
             "gate must be released after cancellation cleanup"
         );
     }
@@ -418,8 +482,11 @@ mod tests {
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let (client, mut server) = UnixStream::pair().unwrap();
-        let mut task =
-            tokio::spawn(async move { launcher.serve(&mut server, &task_cancellation).await });
+        let mut task = tokio::spawn(async move {
+            launcher
+                .serve(&mut server, &task_cancellation, SocialUiMode::Full)
+                .await
+        });
         wait_for_file(&pid_path).await;
         let pid = recorded_pid(&pid_path);
 
@@ -434,5 +501,62 @@ mod tests {
             .unwrap()
             .expect_err("status write to a disconnected peer must fail");
         assert!(!process_exists(pid), "disconnected child must be reaped");
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_failure_terminates_child_and_releases_gate() {
+        let (helper, _starts, pid_path) = blocking_helper(1);
+        let helper_path = helper.path.clone();
+        let launcher = SocialUiLauncher::from_path(helper_path.clone());
+        let cancellation = CancellationToken::new();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        drop(client);
+
+        launcher
+            .serve(&mut server, &cancellation, SocialUiMode::Full)
+            .await
+            .expect_err("a closed requester must reject the acknowledgement");
+        timeout(Duration::from_millis(250), launcher.wait_idle())
+            .await
+            .expect("acknowledgement failure must release the launcher gate");
+        if pid_path.exists() {
+            assert!(
+                !process_exists(recorded_pid(&pid_path)),
+                "a child started before acknowledgement failure must be reaped"
+            );
+        }
+
+        write_helper_file(&helper_path, "exit 0", 0o700);
+        assert_eq!(
+            served_response(&launcher, SocialUiMode::InviteOnly).await,
+            [SOCIAL_UI_ACCEPTED, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn version_one_client_rejects_a_legacy_status_and_legacy_child_is_reaped() {
+        let (helper, _starts, pid_path) = blocking_helper(1);
+        let helper_path = helper.path.clone();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let legacy_service = tokio::spawn(async move {
+            let mut child = tokio::process::Command::new(helper_path).spawn().unwrap();
+            let mut unexpected_payload = [0_u8; 1];
+            server.read_exact(&mut unexpected_payload).await.unwrap();
+            terminate_and_reap(&mut child).await;
+            write_status(&mut server, 2).await.unwrap();
+        });
+        wait_for_file(&pid_path).await;
+        let pid = recorded_pid(&pid_path);
+
+        client.write_all(&[1, 1]).await.unwrap();
+        let legacy_terminal = client.read_u8().await.unwrap();
+        assert_eq!(legacy_terminal, 2);
+        assert_ne!(legacy_terminal, SOCIAL_UI_ACCEPTED);
+        client.shutdown().await.unwrap();
+        legacy_service.await.unwrap();
+        assert!(
+            !process_exists(pid),
+            "legacy child must be reaped on cutover"
+        );
     }
 }

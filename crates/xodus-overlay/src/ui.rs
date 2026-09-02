@@ -11,8 +11,8 @@ use crate::action::{InputMapper, KeyInput, UiAction};
 use crate::client::{ClientWorker, ClientWorkerRequestError};
 use crate::controller::ControllerListener;
 use crate::model::{
-    ModelEffect, OverlayModel, RenderedView, UiOutcome, with_action_effect, with_detached_view,
-    with_response_effect,
+    ModelEffect, OverlayModel, RenderedView, UiMode, UiOutcome, with_action_effect,
+    with_detached_view, with_response_effect,
 };
 
 const APPLICATION_ID: &str = "com.xodusgaming.XodusOverlay";
@@ -27,20 +27,20 @@ struct Widgets {
 }
 
 #[must_use]
-pub fn run() -> i32 {
+pub fn run(mode: UiMode) -> i32 {
     let application = adw::Application::builder()
         .application_id(APPLICATION_ID)
         .build();
     let exit_code = Rc::new(Cell::new(UiOutcome::Failed.exit_code()));
     let activation_exit = Rc::clone(&exit_code);
     application.connect_activate(move |application| {
-        build_window(application, Rc::clone(&activation_exit));
+        build_window(application, Rc::clone(&activation_exit), mode);
     });
     application.run();
     exit_code.get()
 }
 
-fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
+fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>, mode: UiMode) {
     install_css();
 
     let header = adw::HeaderBar::builder()
@@ -89,7 +89,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
         join,
         refresh,
     };
-    let model = Rc::new(RefCell::new(OverlayModel::new()));
+    let model = Rc::new(RefCell::new(OverlayModel::with_mode(mode)));
     render_model(&model, &widgets);
 
     let (client, responses) = ClientWorker::start_default();
@@ -347,7 +347,10 @@ fn render(view: &RenderedView, widgets: &Widgets) {
     widgets.status.set_label(&view.status);
     let has_selection = view.selected.is_some();
     widgets.invite.set_sensitive(has_selection && !view.busy);
-    widgets.join.set_sensitive(has_selection && !view.busy);
+    widgets.join.set_visible(view.allow_join);
+    widgets
+        .join
+        .set_sensitive(view.allow_join && has_selection && !view.busy);
     widgets.refresh.set_sensitive(!view.busy);
 }
 

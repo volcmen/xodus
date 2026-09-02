@@ -11,9 +11,10 @@ use xodus_overlay::action::{GamepadButton, GamepadInput, InputMapper, KeyInput, 
 use xodus_overlay::client::{ClientError, ClientWorker, ClientWorkerRequestError, SocialClient};
 use xodus_overlay::controller::{ControllerDeviceEvent, ControllerInputState, ControllerState};
 use xodus_overlay::model::{
-    ModelEffect, OverlayModel, UiOutcome, ViewKind, with_action_effect, with_detached_view,
+    ModelEffect, OverlayModel, UiMode, UiOutcome, ViewKind, with_action_effect, with_detached_view,
     with_response_effect,
 };
+use xodus_overlay::parse_ui_mode;
 use xodus_social_protocol::{
     FriendHandle, SocialFriend, SocialPresence, SocialRequest, SocialResponse, SocialSnapshot,
     decode_frame, encode_frame, read_frame,
@@ -95,6 +96,19 @@ fn every_keyboard_and_xbox_button_maps_to_the_required_semantic_action() {
         InputMapper::key(KeyInput::Escape),
         InputMapper::default().gamepad(GamepadInput::ButtonPressed(GamepadButton::East))
     );
+}
+
+#[test]
+fn command_line_mode_is_explicit_and_rejects_unknown_arguments() {
+    assert_eq!(parse_ui_mode([] as [&str; 0]), Ok(UiMode::Full));
+    assert_eq!(parse_ui_mode(["--mode", "full"]), Ok(UiMode::Full));
+    assert_eq!(
+        parse_ui_mode(["--mode", "invite-only"]),
+        Ok(UiMode::InviteOnly)
+    );
+    assert!(parse_ui_mode(["--mode"]).is_err());
+    assert!(parse_ui_mode(["--mode", "unknown"]).is_err());
+    assert!(parse_ui_mode(["--mode", "full", "extra"]).is_err());
 }
 
 #[test]
@@ -181,6 +195,10 @@ fn model_covers_loading_empty_friends_error_success_and_cancellation() {
     });
     assert_eq!(model.view().kind, ViewKind::Error);
     assert_eq!(model.view().friends.len(), 1);
+    assert!(matches!(
+        model.action(UiAction::Invite),
+        ModelEffect::Request(SocialRequest::InviteFriend { .. })
+    ));
 
     assert_eq!(
         model.apply_response(SocialResponse::Success {
@@ -278,6 +296,13 @@ fn synchronous_action_close_callback_can_reborrow_the_model() {
 #[test]
 fn synchronous_response_close_callback_can_reborrow_the_model() {
     let model = RefCell::new(OverlayModel::new());
+    model
+        .borrow_mut()
+        .apply_response(snapshot(vec![friend("Driver One", SocialPresence::Online)]));
+    assert!(matches!(
+        model.borrow_mut().action(UiAction::Invite),
+        ModelEffect::Request(SocialRequest::InviteFriend { .. })
+    ));
 
     with_response_effect(
         &model,
@@ -335,6 +360,64 @@ fn semantic_invite_join_and_activate_requests_carry_only_selected_handles() {
             friend: offline_handle
         })
     );
+}
+
+#[test]
+fn invite_only_mode_hides_join_and_maps_keyboard_and_controller_activation_to_invite() {
+    let selected = friend("Online", SocialPresence::Online);
+    let selected_handle = selected.handle;
+    let mut model = OverlayModel::with_mode(UiMode::InviteOnly);
+    model.apply_response(snapshot(vec![selected]));
+
+    assert!(!model.view().allow_join);
+    assert_eq!(
+        model.action(InputMapper::key(KeyInput::J).unwrap()),
+        ModelEffect::None
+    );
+    let mut mapper = InputMapper::default();
+    assert_eq!(
+        model.action(
+            mapper
+                .gamepad(GamepadInput::ButtonPressed(GamepadButton::North))
+                .unwrap()
+        ),
+        ModelEffect::None
+    );
+    assert_eq!(
+        model.action(InputMapper::key(KeyInput::Enter).unwrap()),
+        ModelEffect::Request(SocialRequest::InviteFriend {
+            friend: selected_handle
+        })
+    );
+
+    model.apply_response(SocialResponse::Error {
+        message: "synthetic keyboard failure".to_owned(),
+    });
+    assert_eq!(
+        model.action(
+            mapper
+                .gamepad(GamepadInput::ButtonPressed(GamepadButton::South))
+                .unwrap()
+        ),
+        ModelEffect::Request(SocialRequest::InviteFriend {
+            friend: selected_handle
+        })
+    );
+}
+
+#[test]
+fn invite_only_mode_never_completes_without_a_matching_invite_request() {
+    let mut model = OverlayModel::with_mode(UiMode::InviteOnly);
+    model.apply_response(snapshot(vec![friend("Online", SocialPresence::Online)]));
+
+    assert_eq!(
+        model.apply_response(SocialResponse::Success {
+            message: "synthetic unexpected success".to_owned(),
+        }),
+        ModelEffect::None
+    );
+    assert_eq!(model.view().kind, ViewKind::Error);
+    assert_eq!(model.outcome(), UiOutcome::Failed);
 }
 
 #[test]

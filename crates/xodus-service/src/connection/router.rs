@@ -1,6 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use xodus::models::secrets::LegacyToken;
 use xodus::tokens::TokenManager;
@@ -8,7 +10,9 @@ use xodus::tokens::TokenManager;
 use crate::invite_activation::{InviteActivationRelay, handle_publisher, handle_subscriber};
 use crate::simple_context::SimpleContext;
 use crate::social_ipc::{SharedSocialService, handle_socket};
-use crate::social_ui::SocialUiLauncher;
+use crate::social_ui::{SocialUiLauncher, SocialUiMode};
+
+const SOCIAL_UI_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct RouteServices {
@@ -115,21 +119,69 @@ pub(crate) async fn handle_social_ui(
     launcher: &SocialUiLauncher,
     cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
-    launcher.serve(socket, cancellation).await
+    handle_social_ui_with_timeout(socket, launcher, cancellation, SOCIAL_UI_REQUEST_TIMEOUT).await
+}
+
+pub(crate) async fn handle_social_ui_with_timeout(
+    socket: &mut tokio::net::UnixStream,
+    launcher: &SocialUiLauncher,
+    cancellation: &CancellationToken,
+    request_timeout: Duration,
+) -> std::io::Result<()> {
+    let mut request = [0_u8; 2];
+    let mode = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        read = timeout(request_timeout, socket.read_exact(&mut request)) => {
+            match read {
+                Ok(Ok(_)) => SocialUiMode::from_request(request),
+                Ok(Err(error)) => {
+                    log::debug!("Social UI request disconnected before its payload: {error}");
+                    None
+                }
+                Err(_) => {
+                    log::warn!("Social UI request payload timed out");
+                    None
+                }
+            }
+        }
+    };
+    let Some(mode) = mode else {
+        socket.write_all(&[2]).await?;
+        return socket.shutdown().await;
+    };
+    launcher.serve(socket, cancellation, mode).await
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::time::Duration;
 
-    use tokio::io::AsyncReadExt;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
     use tokio_util::sync::CancellationToken;
 
-    use crate::social_ui::SocialUiLauncher;
+    use crate::social_ui::{SOCIAL_UI_ACCEPTED, SocialUiLauncher};
 
-    use super::{authorize_same_uid_then, handle_social_ui};
+    use super::{authorize_same_uid_then, handle_social_ui, handle_social_ui_with_timeout};
+
+    fn recording_overlay() -> (TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overlay-helper");
+        let launched = directory.path().join("launched");
+        fs::write(
+            &path,
+            "#!/bin/sh\n: > \"$(dirname \"$0\")/launched\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        (directory, path, launched)
+    }
 
     #[test]
     fn social_peer_uid_gate_accepts_same_uid_and_rejects_before_backend_invocation() {
@@ -159,10 +211,84 @@ mod tests {
                 async move { handle_social_ui(&mut server, &launcher, &cancellation).await },
             );
 
+        client.write_all(&[1, 1]).await.unwrap();
+        assert_eq!(client.read_u8().await.unwrap(), SOCIAL_UI_ACCEPTED);
         assert_eq!(client.read_u8().await.unwrap(), 0);
         let mut trailing = Vec::new();
         client.read_to_end(&mut trailing).await.unwrap();
         assert!(trailing.is_empty());
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn social_xdui_handler_rejects_unknown_version_and_mode_without_launching() {
+        for request in [[2, 1], [1, 2]] {
+            let (_directory, overlay, launched) = recording_overlay();
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let launcher = SocialUiLauncher::from_path(overlay);
+            let cancellation = CancellationToken::new();
+            let task = tokio::spawn(async move {
+                handle_social_ui(&mut server, &launcher, &cancellation).await
+            });
+
+            client.write_all(&request).await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, [2]);
+            task.await.unwrap().unwrap();
+            assert!(!launched.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_free_legacy_request_times_out_with_one_rejection_byte() {
+        let (_directory, overlay, launched) = recording_overlay();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let launcher = SocialUiLauncher::from_path(overlay);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(async move {
+            handle_social_ui_with_timeout(
+                &mut server,
+                &launcher,
+                &cancellation,
+                Duration::from_millis(10),
+            )
+            .await
+        });
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, [2]);
+        task.await.unwrap().unwrap();
+        assert!(!launched.exists());
+    }
+
+    #[tokio::test]
+    async fn service_cancellation_interrupts_the_pre_ack_request_wait() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let launcher = SocialUiLauncher::from_path(PathBuf::from("/usr/bin/true"));
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let mut task = tokio::spawn(async move {
+            handle_social_ui_with_timeout(
+                &mut server,
+                &launcher,
+                &task_cancellation,
+                Duration::from_secs(1),
+            )
+            .await
+        });
+
+        cancellation.cancel();
+        if tokio::time::timeout(Duration::from_millis(50), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            panic!("service cancellation must interrupt the request payload wait");
+        }
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, [2]);
     }
 }
