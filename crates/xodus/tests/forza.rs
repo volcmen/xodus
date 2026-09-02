@@ -35,7 +35,15 @@ mod forza {
 
     #[test]
     fn rejects_invalid_xuids_and_activation_uris() {
-        for invalid in ["", "not-digits", "123456789012345678901"] {
+        assert!(Xuid::new("18446744073709551615").is_ok());
+        assert_ne!(Xuid::new("0001").unwrap(), Xuid::new("1").unwrap());
+        for invalid in [
+            "",
+            "not-digits",
+            "18446744073709551616",
+            "99999999999999999999",
+            "123456789012345678901",
+        ] {
             assert!(Xuid::new(invalid).is_err());
         }
         assert!(

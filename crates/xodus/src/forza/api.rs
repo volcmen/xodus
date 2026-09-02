@@ -371,8 +371,23 @@ mod tests {
 
     #[tokio::test]
     async fn empty_friends_response() {
-        let (base, _) = mock_server(vec![MockResponse::json(r#"{"people":[]}"#)]).await;
+        let (base, requests) = mock_server(vec![MockResponse::json(r#"{"people":[]}"#)]).await;
         assert!(session(base).friends().await.unwrap().is_empty());
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.starts_with(
+            "GET /users/xuid(2810000000000000)/people/friends/decoration/presenceDetail HTTP/1.1\r\n"
+        ));
+        let request = request.to_ascii_lowercase();
+        assert!(request.contains("\r\nauthorization: xbl3.0 x=synthetic-uhs;synthetic-token\r\n"));
+        assert!(request.contains("\r\nx-xbl-contract-version: 7\r\n"));
+        let signature = request
+            .lines()
+            .find_map(|line| line.strip_prefix("signature:"))
+            .expect("signed PeopleHub request");
+        assert!(!signature.trim().is_empty());
     }
 
     #[tokio::test]

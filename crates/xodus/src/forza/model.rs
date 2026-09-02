@@ -11,7 +11,10 @@ pub struct Xuid(String);
 impl Xuid {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelError> {
         let value = value.into();
-        if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit())
+        if value.is_empty()
+            || value.len() > 20
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || value.parse::<u64>().is_err()
         {
             return Err(ModelError::InvalidXuid);
         }
@@ -191,7 +194,7 @@ pub(crate) fn parse_activity(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
             else {
-                return Ok(None);
+                continue;
             };
             return ForzaActivity::new(connection_string.to_owned()).map(Some);
         }
@@ -252,4 +255,32 @@ fn validate_invite_uri(uri: &Url) -> Result<(), ModelError> {
         return Err(ModelError::InvalidInviteUri);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{Xuid, parse_activity};
+
+    #[test]
+    fn activity_skips_non_joinable_candidates_before_a_valid_forza_session() {
+        let requested = Xuid::new("2810000000000001").unwrap();
+        let body = json!({
+            "userActivities": [{
+                "userId": "2810000000000001",
+                "activities": [
+                    { "titleId": 1842668909 },
+                    { "titleId": "1842668909", "connectionString": "" },
+                    {
+                        "titleId": 1842668909,
+                        "connectionString": "synthetic-valid-session"
+                    }
+                ]
+            }]
+        });
+
+        let activity = parse_activity(&body, &requested).unwrap().unwrap();
+        assert_eq!(activity.connection_string(), "synthetic-valid-session");
+    }
 }
