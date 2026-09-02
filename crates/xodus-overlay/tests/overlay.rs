@@ -1,4 +1,10 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::io::Read;
+use std::os::unix::net::UnixStream as StdUnixStream;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt, split};
 use xodus::forza::ipc::{encode_frame, read_frame};
@@ -6,9 +12,12 @@ use xodus::forza::{
     FriendHandle, SocialFriend, SocialPresence, SocialRequest, SocialResponse, SocialSnapshot,
 };
 use xodus_overlay::action::{GamepadButton, GamepadInput, InputMapper, KeyInput, UiAction};
-use xodus_overlay::client::{ClientError, SocialClient};
-use xodus_overlay::controller::{ControllerDeviceEvent, ControllerState};
-use xodus_overlay::model::{ModelEffect, OverlayModel, UiOutcome, ViewKind};
+use xodus_overlay::client::{ClientError, ClientWorker, SocialClient};
+use xodus_overlay::controller::{ControllerDeviceEvent, ControllerInputState, ControllerState};
+use xodus_overlay::model::{
+    ModelEffect, OverlayModel, UiOutcome, ViewKind, with_action_effect, with_detached_view,
+    with_response_effect,
+};
 
 fn friend(label: &str, presence: SocialPresence) -> SocialFriend {
     SocialFriend {
@@ -119,6 +128,25 @@ fn controller_state_survives_zero_hotplug_and_active_removal() {
 }
 
 #[test]
+fn active_controller_change_rearms_stick_hysteresis() {
+    let mut input = ControllerInputState::default();
+    input.apply_device(ControllerDeviceEvent::Added(7));
+    input.apply_device(ControllerDeviceEvent::Added(3));
+    assert_eq!(
+        input.gamepad(7, GamepadInput::LeftY(-20_000)),
+        Some(UiAction::MoveUp)
+    );
+    assert_eq!(input.gamepad(7, GamepadInput::LeftY(-25_000)), None);
+
+    input.apply_device(ControllerDeviceEvent::Removed(7));
+    assert_eq!(input.active(), Some(3));
+    assert_eq!(
+        input.gamepad(3, GamepadInput::LeftY(-20_000)),
+        Some(UiAction::MoveUp)
+    );
+}
+
+#[test]
 fn model_covers_loading_empty_friends_error_success_and_cancellation() {
     let mut model = OverlayModel::new();
     assert_eq!(model.view().kind, ViewKind::Loading);
@@ -193,6 +221,60 @@ fn model_keeps_selection_safe_and_clamps_it_after_refresh() {
 
     model.apply_response(snapshot(Vec::new()));
     assert_eq!(model.view().selected, None);
+}
+
+#[test]
+fn detached_view_allows_synchronous_selection_callback_mutation() {
+    let model = RefCell::new(OverlayModel::new());
+    model
+        .borrow_mut()
+        .apply_response(snapshot(vec![friend("Driver One", SocialPresence::Online)]));
+
+    with_detached_view(&model, |view| {
+        assert_eq!(view.selected, Some(0));
+        model.borrow_mut().select(None);
+    });
+    assert_eq!(model.borrow().view().selected, None);
+}
+
+#[test]
+fn action_request_failure_callback_can_reborrow_the_model() {
+    let model = RefCell::new(OverlayModel::new());
+    model
+        .borrow_mut()
+        .apply_response(snapshot(vec![friend("Driver One", SocialPresence::Online)]));
+
+    with_action_effect(&model, UiAction::Invite, |effect| {
+        assert!(matches!(effect, ModelEffect::Request(_)));
+        model.borrow_mut().service_failed();
+    });
+    assert_eq!(model.borrow().outcome(), UiOutcome::Failed);
+}
+
+#[test]
+fn synchronous_action_close_callback_can_reborrow_the_model() {
+    let model = RefCell::new(OverlayModel::new());
+
+    with_action_effect(&model, UiAction::Back, |effect| {
+        assert_eq!(effect, ModelEffect::Close(UiOutcome::Cancelled));
+        assert_eq!(model.borrow().outcome(), UiOutcome::Cancelled);
+    });
+}
+
+#[test]
+fn synchronous_response_close_callback_can_reborrow_the_model() {
+    let model = RefCell::new(OverlayModel::new());
+
+    with_response_effect(
+        &model,
+        SocialResponse::Success {
+            message: "Invite sent".to_owned(),
+        },
+        |effect| {
+            assert_eq!(effect, ModelEffect::Close(UiOutcome::Completed));
+            assert_eq!(model.borrow().outcome(), UiOutcome::Completed);
+        },
+    );
 }
 
 #[test]
@@ -352,4 +434,31 @@ async fn concurrent_client_requests_are_serialized_as_complete_frames() {
         );
     }
     assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[test]
+fn client_worker_stop_interrupts_in_flight_request_and_is_idempotent() {
+    let (client_socket, mut server_socket) = StdUnixStream::pair().unwrap();
+    server_socket
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let (mut worker, _responses) = ClientWorker::from_stream(client_socket);
+    worker.request(SocialRequest::Snapshot).unwrap();
+
+    let mut header = [0_u8; 10];
+    server_socket.read_exact(&mut header).unwrap();
+    assert_eq!(&header[..4], b"XDSO");
+    let length = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
+    let mut payload = vec![0_u8; length];
+    server_socket.read_exact(&mut payload).unwrap();
+
+    let (stopped, confirmation) = mpsc::channel();
+    thread::spawn(move || {
+        worker.stop();
+        worker.stop();
+        stopped.send(()).unwrap();
+    });
+    confirmation
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker shutdown must interrupt a blocked response read");
 }

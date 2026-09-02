@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use xodus::forza::{SocialFriend, SocialPresence, SocialRequest, SocialResponse};
 
 use crate::action::UiAction;
@@ -58,6 +60,32 @@ pub struct OverlayModel {
     kind: ViewKind,
     status: String,
     outcome: UiOutcome,
+}
+
+pub fn with_detached_view<T>(
+    model: &RefCell<OverlayModel>,
+    render: impl FnOnce(&RenderedView) -> T,
+) -> T {
+    let view = { model.borrow().view() };
+    render(&view)
+}
+
+pub fn with_action_effect<T>(
+    model: &RefCell<OverlayModel>,
+    action: UiAction,
+    handle: impl FnOnce(ModelEffect) -> T,
+) -> T {
+    let effect = { model.borrow_mut().action(action) };
+    handle(effect)
+}
+
+pub fn with_response_effect<T>(
+    model: &RefCell<OverlayModel>,
+    response: SocialResponse,
+    handle: impl FnOnce(ModelEffect) -> T,
+) -> T {
+    let effect = { model.borrow_mut().apply_response(response) };
+    handle(effect)
 }
 
 impl Default for OverlayModel {

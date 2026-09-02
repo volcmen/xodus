@@ -1,17 +1,19 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::gdk;
-use xodus::forza::{SocialPresence, SocialRequest, SocialResponse};
+use xodus::forza::SocialPresence;
 
 use crate::action::{InputMapper, KeyInput, UiAction};
-use crate::client::{ClientError, SocialClient};
+use crate::client::ClientWorker;
 use crate::controller::ControllerListener;
-use crate::model::{ModelEffect, OverlayModel, UiOutcome};
+use crate::model::{
+    ModelEffect, OverlayModel, RenderedView, UiOutcome, with_action_effect, with_detached_view,
+    with_response_effect,
+};
 
 const APPLICATION_ID: &str = "com.xodusgaming.XodusOverlay";
 
@@ -86,9 +88,10 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
         join,
     };
     let model = Rc::new(RefCell::new(OverlayModel::new()));
-    render(&model.borrow(), &widgets);
+    render_model(&model, &widgets);
 
-    let (requests, responses) = spawn_client_worker();
+    let (client, responses) = ClientWorker::start_default();
+    let client = Rc::new(RefCell::new(client));
     let alive = Rc::new(Cell::new(true));
     let window_weak = window.downgrade();
 
@@ -97,7 +100,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
         UiAction::Invite,
         &model,
         &widgets,
-        &requests,
+        &client,
         &window_weak,
         &exit_code,
     );
@@ -106,7 +109,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
         UiAction::Join,
         &model,
         &widgets,
-        &requests,
+        &client,
         &window_weak,
         &exit_code,
     );
@@ -115,7 +118,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
         UiAction::Refresh,
         &model,
         &widgets,
-        &requests,
+        &client,
         &window_weak,
         &exit_code,
     );
@@ -131,7 +134,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
     {
         let model = Rc::clone(&model);
         let widgets = widgets.clone();
-        let requests = requests.clone();
+        let client = Rc::clone(&client);
         let window = window_weak.clone();
         let exit_code = Rc::clone(&exit_code);
         widgets.list.clone().connect_row_activated(move |_, _| {
@@ -139,7 +142,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
                 UiAction::Activate,
                 &model,
                 &widgets,
-                &requests,
+                &client,
                 &window,
                 &exit_code,
             );
@@ -150,14 +153,14 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
     {
         let model = Rc::clone(&model);
         let widgets = widgets.clone();
-        let requests = requests.clone();
+        let client = Rc::clone(&client);
         let window = window_weak.clone();
         let exit_code = Rc::clone(&exit_code);
         keys.connect_key_pressed(move |_, key, _, _| {
             let Some(action) = InputMapper::key(map_key(key)) else {
                 return gtk::glib::Propagation::Proceed;
             };
-            dispatch(action, &model, &widgets, &requests, &window, &exit_code);
+            dispatch(action, &model, &widgets, &client, &window, &exit_code);
             gtk::glib::Propagation::Stop
         });
     }
@@ -179,11 +182,11 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
             loop {
                 match responses.try_recv() {
                     Ok(Ok(response)) => {
-                        if let ModelEffect::Close(outcome) =
-                            model.borrow_mut().apply_response(response)
-                        {
-                            close = Some(outcome);
-                        }
+                        with_response_effect(&model, response, |effect| {
+                            if let ModelEffect::Close(outcome) = effect {
+                                close = Some(outcome);
+                            }
+                        });
                         changed = true;
                     }
                     Ok(Err(_)) => {
@@ -200,7 +203,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
                 }
             }
             if changed {
-                render(&model.borrow(), &widgets);
+                render_model(&model, &widgets);
             }
             if let Some(outcome) = close {
                 exit_code.set(outcome.exit_code());
@@ -218,11 +221,11 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
     }
 
     let (controller_actions, actions) = mpsc::channel();
-    let controller = Rc::new(ControllerListener::start(controller_actions));
+    let controller = Rc::new(RefCell::new(ControllerListener::start(controller_actions)));
     {
         let model = Rc::clone(&model);
         let widgets = widgets.clone();
-        let requests = requests.clone();
+        let client = Rc::clone(&client);
         let window = window_weak.clone();
         let exit_code = Rc::clone(&exit_code);
         let alive = Rc::clone(&alive);
@@ -231,7 +234,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
                 return gtk::glib::ControlFlow::Break;
             }
             while let Ok(action) = actions.try_recv() {
-                dispatch(action, &model, &widgets, &requests, &window, &exit_code);
+                dispatch(action, &model, &widgets, &client, &window, &exit_code);
             }
             gtk::glib::ControlFlow::Continue
         });
@@ -241,6 +244,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
         let model = Rc::clone(&model);
         let alive = Rc::clone(&alive);
         let controller = Rc::clone(&controller);
+        let client = Rc::clone(&client);
         window.connect_close_request(move |_| {
             alive.set(false);
             let outcome = match model.borrow().outcome() {
@@ -248,14 +252,19 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
                 outcome => outcome,
             };
             exit_code.set(outcome.exit_code());
-            drop(Rc::clone(&controller));
+            controller.borrow_mut().stop();
+            client.borrow_mut().stop();
             gtk::glib::Propagation::Proceed
         });
     }
 
-    if requests.send(OverlayModel::initial_request()).is_err() {
+    if client
+        .borrow()
+        .request(OverlayModel::initial_request())
+        .is_err()
+    {
         model.borrow_mut().service_failed();
-        render(&model.borrow(), &widgets);
+        render_model(&model, &widgets);
     }
     window.present();
 }
@@ -265,17 +274,17 @@ fn connect_button(
     action: UiAction,
     model: &Rc<RefCell<OverlayModel>>,
     widgets: &Widgets,
-    requests: &mpsc::Sender<SocialRequest>,
+    client: &Rc<RefCell<ClientWorker>>,
     window: &gtk::glib::WeakRef<adw::ApplicationWindow>,
     exit_code: &Rc<Cell<i32>>,
 ) {
     let model = Rc::clone(model);
     let widgets = widgets.clone();
-    let requests = requests.clone();
+    let client = Rc::clone(client);
     let window = window.clone();
     let exit_code = Rc::clone(exit_code);
     button.connect_clicked(move |_| {
-        dispatch(action, &model, &widgets, &requests, &window, &exit_code);
+        dispatch(action, &model, &widgets, &client, &window, &exit_code);
     });
 }
 
@@ -283,14 +292,14 @@ fn dispatch(
     action: UiAction,
     model: &Rc<RefCell<OverlayModel>>,
     widgets: &Widgets,
-    requests: &mpsc::Sender<SocialRequest>,
+    client: &Rc<RefCell<ClientWorker>>,
     window: &gtk::glib::WeakRef<adw::ApplicationWindow>,
     exit_code: &Rc<Cell<i32>>,
 ) {
-    match model.borrow_mut().action(action) {
+    with_action_effect(model, action, |effect| match effect {
         ModelEffect::None => {}
         ModelEffect::Request(request) => {
-            if requests.send(request).is_err() {
+            if client.borrow().request(request).is_err() {
                 model.borrow_mut().service_failed();
             }
         }
@@ -300,12 +309,15 @@ fn dispatch(
                 window.close();
             }
         }
-    }
-    render(&model.borrow(), widgets);
+    });
+    render_model(model, widgets);
 }
 
-fn render(model: &OverlayModel, widgets: &Widgets) {
-    let view = model.view();
+fn render_model(model: &RefCell<OverlayModel>, widgets: &Widgets) {
+    with_detached_view(model, |view| render(view, widgets));
+}
+
+fn render(view: &RenderedView, widgets: &Widgets) {
     while let Some(child) = widgets.list.first_child() {
         widgets.list.remove(&child);
     }
@@ -331,41 +343,6 @@ fn render(model: &OverlayModel, widgets: &Widgets) {
     let has_selection = view.selected.is_some();
     widgets.invite.set_sensitive(has_selection);
     widgets.join.set_sensitive(has_selection);
-}
-
-fn spawn_client_worker() -> (
-    mpsc::Sender<SocialRequest>,
-    mpsc::Receiver<Result<SocialResponse, ClientError>>,
-) {
-    let (requests, incoming) = mpsc::channel();
-    let (outgoing, responses) = mpsc::channel();
-    thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(_) => {
-                let _ = outgoing.send(Err(ClientError::Unavailable));
-                return;
-            }
-        };
-        let client = match runtime.block_on(SocialClient::connect_default()) {
-            Ok(client) => client,
-            Err(error) => {
-                let _ = outgoing.send(Err(error));
-                return;
-            }
-        };
-        while let Ok(request) = incoming.recv() {
-            let response = runtime.block_on(client.request(request));
-            let disconnected = response.is_err();
-            if outgoing.send(response).is_err() || disconnected {
-                return;
-            }
-        }
-    });
-    (requests, responses)
 }
 
 fn install_css() {
