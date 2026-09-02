@@ -1,8 +1,13 @@
+use std::future::Future;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xodus::models::live::ExchangeUserTokenOutcome;
 use xodus::models::secrets::Token;
 use xodus::models::soap;
-use xodus::models::xgameruntime::xuser::{MSATokenRequest, MSATokenResponse};
+use xodus::models::xgameruntime::xuser::{
+    MSATokenRequest, MSATokenResponse, ValidatedXstsTokenRequest, XstsTokenRequest,
+    XstsTokenResponse,
+};
 use xodus::proto::xodus::XodusMessageType;
 
 use crate::XML_MAGIC;
@@ -40,6 +45,21 @@ pub async fn parse_message(
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     match message_type {
         XodusMessageType::Ping => Ok(buffer),
+        XodusMessageType::XstsTokenRequest => {
+            parse_title_xsts_request_with(&buffer, |request| async move {
+                log::debug!("Minting a validated title-scoped Xbox authorization");
+                xodus::tokens::mint_title_xsts(
+                    &context.client,
+                    context.tokens(),
+                    &request.client_id,
+                    request.title_id,
+                    &request.relying_party,
+                )
+                .await
+                .map(Into::into)
+            })
+            .await
+        }
         XodusMessageType::MsaTokenRequest => {
             log::debug!("Raw buffer: {buffer:?}");
             let string_buf = std::str::from_utf8(&buffer)?;
@@ -128,5 +148,71 @@ pub async fn parse_message(
             }
         }
         _ => Err("Unimplemented".into()),
+    }
+}
+
+async fn parse_title_xsts_request_with<Authorize, AuthorizeFuture, AuthorizeError>(
+    buffer: &[u8],
+    authorize: Authorize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>
+where
+    Authorize: FnOnce(ValidatedXstsTokenRequest) -> AuthorizeFuture,
+    AuthorizeFuture: Future<Output = Result<XstsTokenResponse, AuthorizeError>>,
+    AuthorizeError: std::error::Error + Send + Sync + 'static,
+{
+    let request =
+        quick_xml::de::from_str::<XstsTokenRequest>(std::str::from_utf8(buffer)?)?.validate()?;
+    let response = authorize(request).await?;
+    Ok(quick_xml::se::to_string(&response)?.into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use xodus::models::xgameruntime::xuser::XstsTokenResponse;
+
+    use super::parse_title_xsts_request_with;
+
+    #[tokio::test]
+    async fn title_xsts_ipc_validates_then_serializes_the_scoped_bundle() {
+        let xml = b"<XstsTokenRequest><RelyingParty>rp://forza</RelyingParty><ClientId>000000004CC9D265</ClientId><TitleId>1842668909</TitleId></XstsTokenRequest>";
+        let response = parse_title_xsts_request_with(xml, |request| async move {
+            assert_eq!(request.relying_party, "rp://forza");
+            assert_eq!(request.client_id, "000000004CC9D265");
+            assert_eq!(request.title_id, 1_842_668_909);
+            Ok::<_, io::Error>(XstsTokenResponse {
+                token: "synthetic-xsts".to_owned(),
+                user_hash: "synthetic-uhs".to_owned(),
+                xuid: "2810000000000000".to_owned(),
+                expiry: 4_102_444_800,
+            })
+        })
+        .await
+        .expect("synthetic IPC response");
+
+        let response = String::from_utf8(response).expect("UTF-8 XML response");
+        assert!(response.contains("<Token>synthetic-xsts</Token>"));
+        assert!(response.contains("<UserHash>synthetic-uhs</UserHash>"));
+        assert!(response.contains("<Xuid>2810000000000000</Xuid>"));
+        assert!(response.contains("<Expiry>4102444800</Expiry>"));
+    }
+
+    #[tokio::test]
+    async fn title_xsts_ipc_rejects_invalid_fields_before_authorization() {
+        let xml = b"<XstsTokenRequest><RelyingParty>not a URL</RelyingParty><ClientId>000000004CC9D265</ClientId><TitleId>1842668909</TitleId></XstsTokenRequest>";
+        let result = parse_title_xsts_request_with(xml, |_| async move {
+            panic!("invalid requests must not reach Xbox authorization");
+            #[allow(unreachable_code)]
+            Ok::<_, io::Error>(XstsTokenResponse {
+                token: String::new(),
+                user_hash: String::new(),
+                xuid: String::new(),
+                expiry: 0,
+            })
+        })
+        .await;
+
+        assert!(result.is_err());
     }
 }
