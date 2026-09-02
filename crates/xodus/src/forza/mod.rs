@@ -1,7 +1,12 @@
+pub mod ipc;
+
 mod api;
 mod model;
 
 pub use api::{ForzaSession, XboxServiceError};
+pub use ipc::{
+    FriendHandle, SocialFriend, SocialPresence, SocialRequest, SocialResponse, SocialSnapshot,
+};
 pub use model::{
     ForzaActivity, InviteActivationUri, ModelError, Presence, XboxFriend, Xuid,
     build_invite_accept_uri, parse_friends,
