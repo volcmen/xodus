@@ -7,8 +7,8 @@ accepted upstream protocol, does not replace a general friends/chat UI, and has
 not been installed or validated with a game.
 
 - Official `xodus/main` base: `a92abacb0743f16c769279b9057c8c28435e5ef9`
-- Local reviewed range: `a92abacb0743f16c769279b9057c8c28435e5ef9..08c995b389f2bbc5d0dbc9d51bcadf1453368266`
-- Local source tip: `08c995b389f2bbc5d0dbc9d51bcadf1453368266`
+- Local reviewed range: `a92abacb0743f16c769279b9057c8c28435e5ef9..315c343b9412f6cae9bae7f0c49c4b597b5a0502`
+- Local source tip: `315c343b9412f6cae9bae7f0c49c4b597b5a0502`
 - Task 5 feature tip: `40e76edc822c5880ad9f32b2daae69f15659751e`
 
 The range contains title-scoped authorization, Forza PeopleHub and Multiplayer
@@ -34,6 +34,7 @@ The reviewed source commits are:
 | `2b7982a523d6135e6ad4d8f9ca6cf1c877d26047` | Cancellation-safe session-cache invalidation |
 | `903fc4843d25cbfa84db262e41d29a7ca4f8e319` | Bounded activation delivery and fail-closed socket permissions |
 | `08c995b389f2bbc5d0dbc9d51bcadf1453368266` | Shared overlay in-flight gate and capacity-one request queue |
+| `315c343b9412f6cae9bae7f0c49c4b597b5a0502` | Versioned full/invite-only XDUI request and acknowledgement |
 
 The range also contains maintainer documentation commits
 `966cb58586db725a1d1201a34457eb2e4a62f33f` and
@@ -135,22 +136,43 @@ relay.
 
 ### XDUI — overlay request
 
-After the `XDUI` magic, the requester sends no payload. The service launches at
-most one overlay and replies with exactly one status byte followed by EOF:
+After the `XDUI` magic, a version-1 requester sends exactly two bytes:
+
+| Field | Width | Contract |
+| --- | ---: | --- |
+| Version | `u8` | `1` |
+| Mode | `u8` | `0` full social, `1` Multiplayer Activity invite-only |
+
+The service reads the complete request under a two-second deadline that is also
+interruptible by service cancellation. Unknown, incomplete, or timed-out
+requests are rejected without starting a child. Capacity, cancellation, path,
+and spawn failures are likewise pre-acknowledgement rejections. A rejection
+writes only terminal byte `2` followed by EOF.
+
+After validation and child spawn, the service writes acknowledgement byte
+`0xa1`. Only then does it wait for a terminal outcome and write exactly one
+terminal status byte:
 
 | Status | Meaning |
 | ---: | --- |
-| `0` | The overlay completed an invite or join action. |
+| `0` | The requested overlay action completed. In invite-only mode this is possible only after a matching Invite request succeeds. |
 | `1` | The user deliberately cancelled. |
 | `2` | Busy, path/spawn/process/protocol failure, unexpected exit, signal, disconnect cleanup, or service shutdown. |
 
 The launcher uses a nonblocking shared gate. A nonempty `XODUS_SOCIAL_UI`
 selects an explicit executable path; otherwise the service uses the
-`xodus-overlay` sibling of its own executable. The child receives zero
-arguments and no explicit environment additions. Cancellation, peer
-disconnect, or unexpected requester input kills and then waits for the child
-before releasing the gate. Normal exits are also always waited. No user
-interaction timeout is imposed.
+`xodus-overlay` sibling of its own executable. The child receives only the fixed
+arguments `--mode full` or `--mode invite-only` and no explicit environment
+additions. Cancellation, peer disconnect, unexpected requester input, or an
+acknowledgement-write failure kills and then waits for the child before
+releasing the gate. Normal exits are also always waited. No user-interaction
+timeout is imposed after acknowledgement.
+
+Version 1 deliberately breaks the old payload-free exchange. An old client
+that sends only `XDUI` times out, receives one `2`, and never launches a child.
+A new client does not accept an old service's terminal `0`, `1`, or `2` as the
+required `0xa1` acknowledgement; it closes, allowing the old service to reap
+its child. Both directions are covered by offline compatibility tests.
 
 ## Service API contract
 
@@ -208,6 +230,13 @@ Controller hotplug state tolerates zero devices, resets stick hysteresis when
 the active device changes, and joins its listener on window close. The XDSO
 client worker likewise cancels and joins on close.
 
+Full mode retains Invite and Join. Invite-only mode hides and disables Join;
+`J` and the controller North button cannot dispatch it. Row activation,
+Enter/Space, and the controller South button all dispatch Invite in that mode,
+while `I` and the controller West button remain explicit Invite controls. The
+model binds a successful response to its pending action, so an unsolicited or
+Refresh-associated success cannot produce exit status `0`.
+
 ## Upstream coordination
 
 As verified on 2026-09-01:
@@ -243,7 +272,7 @@ cargo test -p xodus --offline -- --skip test_get_xbox_live_dev_token
 cargo test -p xodus-service --offline
 cargo test -p xodus-overlay --offline
 cargo test --workspace --offline -- --skip test_get_xbox_live_dev_token
-cargo build --release -p xodus-service -p xodus-overlay --offline
+cargo build --release -p xodus-service -p xodus-cli -p xodus-overlay --offline
 rg -n 'Authorization:|XBL3\.0|ms-xbl-multiplayer://inviteAccept\?.+' docs crates || true
 git diff --check
 ```
@@ -267,10 +296,11 @@ Current results:
 - Protocol compatibility tests: **GREEN**, 6 passed. They include a literal
   version-1 `Snapshot` frame assertion in addition to the moved boundary and
   concurrency tests.
-- Filtered workspace tests: **GREEN**, 109 passed, 1 ignored, 1 filtered out
+- Filtered workspace tests: **GREEN**, 117 passed, 1 ignored, 1 filtered out
   across 16 suites. The filtered test is `test_get_xbox_live_dev_token`, an
   upstream anonymous live Microsoft test.
-- Offline release build for `xodus-service` and `xodus-overlay`: **GREEN**.
+- Offline release build for `xodus-service`, `xodus-cli`, and `xodus-overlay`:
+  **GREEN**.
 - Privacy scan: 15 final-tree matches, all existing authorization format
   strings, static documentation templates, synthetic test/protocol data, or
   the literal scan expression itself. No nickname or live identifier was
