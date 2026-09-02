@@ -7,8 +7,8 @@ accepted upstream protocol, does not replace a general friends/chat UI, and has
 not been installed or validated with a game.
 
 - Official `xodus/main` base: `a92abacb0743f16c769279b9057c8c28435e5ef9`
-- Local reviewed range: `a92abacb0743f16c769279b9057c8c28435e5ef9..fb38a3f7ad6c9112e8779f7908ffdcc2b2468f30`
-- Local source tip: `fb38a3f7ad6c9112e8779f7908ffdcc2b2468f30`
+- Local reviewed range: `a92abacb0743f16c769279b9057c8c28435e5ef9..08c995b389f2bbc5d0dbc9d51bcadf1453368266`
+- Local source tip: `08c995b389f2bbc5d0dbc9d51bcadf1453368266`
 - Task 5 feature tip: `40e76edc822c5880ad9f32b2daae69f15659751e`
 
 The range contains title-scoped authorization, Forza PeopleHub and Multiplayer
@@ -30,9 +30,14 @@ The reviewed source commits are:
 | `c202927a56215321064e98ccbd995533e3d7b2e8` | Overlay lifecycle and reentrancy hardening |
 | `40e76edc822c5880ad9f32b2daae69f15659751e` | Service-owned XDUI launcher |
 | `fb38a3f7ad6c9112e8779f7908ffdcc2b2468f30` | Keyring-free shared social protocol crate |
+| `57091ce69c467d95fd27b4e9aecaca34c7eaf7ac` | PeopleHub fallback, authorization lifetime, and bounded social operations |
+| `2b7982a523d6135e6ad4d8f9ca6cf1c877d26047` | Cancellation-safe session-cache invalidation |
+| `903fc4843d25cbfa84db262e41d29a7ca4f8e319` | Bounded activation delivery and fail-closed socket permissions |
+| `08c995b389f2bbc5d0dbc9d51bcadf1453368266` | Shared overlay in-flight gate and capacity-one request queue |
 
-The range also contains the initial maintainer documentation commit
-`966cb58586db725a1d1201a34457eb2e4a62f33f`; it is not a source change.
+The range also contains maintainer documentation commits
+`966cb58586db725a1d1201a34457eb2e4a62f33f` and
+`e8bcd8fcfc473e7ad019c3ee8d32841ee6f98fd3`; neither is a source change.
 
 ## Ownership and trust boundary
 
@@ -56,11 +61,13 @@ display labels, coarse presence, opaque handles, and fixed status text, and
 does not receive a raw XUID, authorization token, connection string, or
 activation URI.
 
-The service socket is created with mode `0600`. The router checks Unix peer
-credentials for the same UID before constructing a connection context or
-dispatching XML, protobuf, XDSO, XDSI, XDAP, or XDUI work. Social/activation
-errors and public evidence use fixed categories or synthetic placeholders;
-transport identifiers and credentials are not logged.
+The service accepts connections only after restricting the socket to exactly
+`0600`. A permission-restriction failure closes the listener, removes the
+socket, and fails startup rather than leaving a misleading service running.
+The router checks Unix peer credentials for the same UID before constructing a
+connection context or dispatching XML, protobuf, XDSO, XDSI, XDAP, or XDUI
+work. Social/activation errors and public evidence use fixed categories or
+synthetic placeholders; transport identifiers and credentials are not logged.
 
 ## Local protocols
 
@@ -100,11 +107,19 @@ replaces the prior map. A handle therefore lives only for the current snapshot;
 using an old or unknown handle returns the fixed stale-selection error without
 calling PeopleHub or Multiplayer Activity.
 
+Each refresh, invite, or join operation has one 30-second bound covering both
+the shared social-service mutex wait and backend I/O. A timeout drops the
+operation future, releases the mutex, cancels pending backend I/O, and returns
+only a fixed safe error. The service does not automatically retry a social
+operation.
+
 ### XDSI — activation subscriber
 
 After the `XDSI` magic, one same-UID client may register as the activation
 subscriber. The service sends repeated frames consisting of `u32 length`
 followed by exactly that many UTF-8 URI bytes. Each URI is capped at 4 KiB.
+The subscriber queue holds at most one pending activation; nonblocking
+backpressure rejects another activation without evicting a healthy subscriber.
 Service cancellation, EOF, or I/O failure unregisters the subscriber.
 
 ### XDAP — activation publisher
@@ -113,7 +128,10 @@ After the `XDAP` magic, the publisher sends one `u32 length` and one UTF-8
 activation URI, also capped at 4 KiB. The service validates the expected
 activation scheme/host and the exact required query fields before publishing
 to the registered subscriber. It replies with one byte: `0` published, `1`
-rejected or unavailable.
+rejected or unavailable. The relay independently requires a nonempty URI of at
+most 4096 bytes before enqueue, including for URIs constructed by XDSO Join.
+XDSO Join reports success only after that URI is accepted by the capacity-one
+relay.
 
 ### XDUI — overlay request
 
@@ -149,6 +167,15 @@ Endpoint paths, title claims, contract versions, and response validation are
 owned by `xodus-service`/the `xodus` library. The overlay and future
 game-facing bridge do not own credentials or transport identifiers.
 
+PeopleHub transport records keep `displayName` and `gamertag` separate. A
+nonempty `displayName` is preferred; a nonempty `gamertag` is the fallback; a
+record with neither is rejected. Title authorization expiry is preserved in
+the cached Forza session. A session that is expired or within 60 seconds of
+expiry is discarded and reminted before use. Any PeopleHub or Multiplayer
+Activity failure, including cancellation or timeout while the session is in
+use, invalidates the cache so a later request can remint. The failed or
+cancelled operation itself is never automatically retried.
+
 ## Overlay and input
 
 The overlay is a normal GTK4/libadwaita application window. SDL3 is linked
@@ -168,6 +195,14 @@ Keyboard and Xbox-style controller inputs reach the same semantic dispatcher:
 | Invite | `I` | West button |
 | Join | `J` | North button |
 | Refresh | `R` or F5 | Start button |
+
+Refresh, Invite, Join, and selected-row activation share one model-owned
+in-flight gate across button, row, keyboard, and controller paths. While busy,
+repeated network actions are ignored and the corresponding controls and rows
+are rendered inactive; navigation and back/cancel remain available. The gate
+clears on a response or client/request failure, while success retains the
+existing close behavior. The nonblocking model-to-client queue has capacity
+one, so it cannot accumulate repeated operations behind the active request.
 
 Controller hotplug state tolerates zero devices, resets stick hysteresis when
 the active device changes, and joins its listener on window close. The XDSO
@@ -226,16 +261,20 @@ Current results:
   scan and the overlay `xodus::` source scan return no matches: **GREEN**.
 - `xodus-social-protocol` has exactly five direct library dependencies:
   `serde`, `serde_json`, `thiserror`, `tokio`, and `uuid`.
-- Strict all-target Clippy for `xodus-social-protocol`, `xodus`,
-  `xodus-service`, and `xodus-overlay`: **GREEN**, no issues.
+- Strict all-target Clippy for every changed package
+  (`xodus-social-protocol`, `xodus`, `xodus-service`, and `xodus-overlay`):
+  **GREEN**, no issues.
 - Protocol compatibility tests: **GREEN**, 6 passed. They include a literal
   version-1 `Snapshot` frame assertion in addition to the moved boundary and
   concurrency tests.
-- Filtered workspace tests: **GREEN**, 86 passed, 1 ignored, 1 filtered out
+- Filtered workspace tests: **GREEN**, 109 passed, 1 ignored, 1 filtered out
   across 16 suites. The filtered test is `test_get_xbox_live_dev_token`, an
   upstream anonymous live Microsoft test.
 - Offline release build for `xodus-service` and `xodus-overlay`: **GREEN**.
-- Privacy scan: 13 final-tree matches, all classified below; no live value.
+- Privacy scan: 15 final-tree matches, all existing authorization format
+  strings, static documentation templates, synthetic test/protocol data, or
+  the literal scan expression itself. No nickname or live identifier was
+  recorded.
 
 Privacy match classification:
 
