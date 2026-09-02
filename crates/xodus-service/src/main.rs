@@ -12,6 +12,7 @@ mod connection;
 mod invite_activation;
 mod simple_context;
 mod social_ipc;
+mod social_ui;
 mod utils;
 
 const XML_MAGIC: u32 = 0x58445358;
@@ -51,6 +52,13 @@ async fn main() {
         let social = Arc::new(Mutex::new(social_ipc::SocialService::new(
             social_ipc::ForzaBackend::new(Arc::clone(&tokens)),
         )));
+        let social_ui = Arc::new(social_ui::SocialUiLauncher::discover());
+        let route_services = connection::router::RouteServices::new(
+            service_uid,
+            social,
+            activations,
+            Arc::clone(&social_ui),
+        );
         loop {
             let accept = tokio::select! {
                 r = listener.accept() => r,
@@ -61,21 +69,13 @@ async fn main() {
             let token = cancellation.clone();
             let device_token = device_token.clone();
             let tokens = tokens.clone();
-            let activations = activations.clone();
-            let social = Arc::clone(&social);
+            let route_services = route_services.clone();
             tokio::spawn(async move {
-                connection::router::route(
-                    accept.0,
-                    token,
-                    device_token,
-                    tokens,
-                    service_uid,
-                    social,
-                    activations,
-                )
-                .await
+                connection::router::route(accept.0, token, device_token, tokens, route_services)
+                    .await
             });
         }
+        social_ui.wait_idle().await;
     }
 
     _ = tokio::fs::remove_file(socket_path).await;

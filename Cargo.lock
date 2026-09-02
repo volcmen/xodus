@@ -7302,6 +7302,7 @@ dependencies = [
  "quick-xml",
  "reqwest 0.13.4",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "xodus",
