@@ -8,7 +8,7 @@ use gtk::gdk;
 use xodus_social_protocol::SocialPresence;
 
 use crate::action::{InputMapper, KeyInput, UiAction};
-use crate::client::ClientWorker;
+use crate::client::{ClientWorker, ClientWorkerRequestError};
 use crate::controller::ControllerListener;
 use crate::model::{
     ModelEffect, OverlayModel, RenderedView, UiOutcome, with_action_effect, with_detached_view,
@@ -23,6 +23,7 @@ struct Widgets {
     status: gtk::Label,
     invite: gtk::Button,
     join: gtk::Button,
+    refresh: gtk::Button,
 }
 
 #[must_use]
@@ -86,6 +87,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
         status,
         invite,
         join,
+        refresh,
     };
     let model = Rc::new(RefCell::new(OverlayModel::new()));
     render_model(&model, &widgets);
@@ -114,7 +116,7 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
         &exit_code,
     );
     connect_button(
-        &refresh,
+        &widgets.refresh,
         UiAction::Refresh,
         &model,
         &widgets,
@@ -258,12 +260,8 @@ fn build_window(application: &adw::Application, exit_code: Rc<Cell<i32>>) {
         });
     }
 
-    if client
-        .borrow()
-        .request(OverlayModel::initial_request())
-        .is_err()
-    {
-        model.borrow_mut().service_failed();
+    if let Err(error) = client.borrow().request(OverlayModel::initial_request()) {
+        apply_request_failure(&model, error);
         render_model(&model, &widgets);
     }
     window.present();
@@ -299,8 +297,8 @@ fn dispatch(
     with_action_effect(model, action, |effect| match effect {
         ModelEffect::None => {}
         ModelEffect::Request(request) => {
-            if client.borrow().request(request).is_err() {
-                model.borrow_mut().service_failed();
+            if let Err(error) = client.borrow().request(request) {
+                apply_request_failure(model, error);
             }
         }
         ModelEffect::Close(outcome) => {
@@ -317,6 +315,13 @@ fn render_model(model: &RefCell<OverlayModel>, widgets: &Widgets) {
     with_detached_view(model, |view| render(view, widgets));
 }
 
+fn apply_request_failure(model: &RefCell<OverlayModel>, error: ClientWorkerRequestError) {
+    match error {
+        ClientWorkerRequestError::Full => model.borrow_mut().request_failed(),
+        ClientWorkerRequestError::Stopped => model.borrow_mut().service_failed(),
+    }
+}
+
 fn render(view: &RenderedView, widgets: &Widgets) {
     while let Some(child) = widgets.list.first_child() {
         widgets.list.remove(&child);
@@ -330,7 +335,7 @@ fn render(view: &RenderedView, widgets: &Widgets) {
         let row = adw::ActionRow::builder()
             .title(&friend.display_label)
             .subtitle(presence)
-            .activatable(true)
+            .activatable(!view.busy)
             .build();
         widgets.list.append(&row);
     }
@@ -341,8 +346,9 @@ fn render(view: &RenderedView, widgets: &Widgets) {
     }
     widgets.status.set_label(&view.status);
     let has_selection = view.selected.is_some();
-    widgets.invite.set_sensitive(has_selection);
-    widgets.join.set_sensitive(has_selection);
+    widgets.invite.set_sensitive(has_selection && !view.busy);
+    widgets.join.set_sensitive(has_selection && !view.busy);
+    widgets.refresh.set_sensitive(!view.busy);
 }
 
 fn install_css() {

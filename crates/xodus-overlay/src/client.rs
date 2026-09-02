@@ -12,6 +12,9 @@ use xodus_social_protocol::{
     FrameWriter, ProtocolError, SocialRequest, SocialResponse, read_frame,
 };
 
+// One request may wait behind the active transport operation; producers never block.
+const REQUEST_QUEUE_CAPACITY: usize = 1;
+
 struct Transport {
     reader: OwnedReadHalf,
     writer: FrameWriter<OwnedWriteHalf>,
@@ -85,14 +88,18 @@ enum ClientTarget {
 }
 
 pub struct ClientWorker {
-    requests: Option<mpsc::UnboundedSender<SocialRequest>>,
+    requests: Option<mpsc::Sender<SocialRequest>>,
     shutdown: watch::Sender<bool>,
     thread: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("Xodus social client worker has stopped")]
-pub struct ClientWorkerStopped;
+pub enum ClientWorkerRequestError {
+    #[error("Xodus social client request queue is full")]
+    Full,
+    #[error("Xodus social client worker has stopped")]
+    Stopped,
+}
 
 impl ClientWorker {
     #[must_use]
@@ -119,7 +126,7 @@ impl ClientWorker {
         Self,
         std_mpsc::Receiver<Result<SocialResponse, ClientError>>,
     ) {
-        let (requests, incoming) = mpsc::unbounded_channel();
+        let (requests, incoming) = mpsc::channel(REQUEST_QUEUE_CAPACITY);
         let (shutdown, cancellation) = watch::channel(false);
         let (outgoing, responses) = std_mpsc::channel();
         let thread = thread::spawn(move || run_worker(target, incoming, cancellation, outgoing));
@@ -133,12 +140,15 @@ impl ClientWorker {
         )
     }
 
-    pub fn request(&self, request: SocialRequest) -> Result<(), ClientWorkerStopped> {
+    pub fn request(&self, request: SocialRequest) -> Result<(), ClientWorkerRequestError> {
         self.requests
             .as_ref()
-            .ok_or(ClientWorkerStopped)?
-            .send(request)
-            .map_err(|_| ClientWorkerStopped)
+            .ok_or(ClientWorkerRequestError::Stopped)?
+            .try_send(request)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ClientWorkerRequestError::Full,
+                mpsc::error::TrySendError::Closed(_) => ClientWorkerRequestError::Stopped,
+            })
     }
 
     pub fn stop(&mut self) {
@@ -159,7 +169,7 @@ impl Drop for ClientWorker {
 
 fn run_worker(
     target: ClientTarget,
-    incoming: mpsc::UnboundedReceiver<SocialRequest>,
+    incoming: mpsc::Receiver<SocialRequest>,
     cancellation: watch::Receiver<bool>,
     outgoing: std_mpsc::Sender<Result<SocialResponse, ClientError>>,
 ) {
@@ -178,7 +188,7 @@ fn run_worker(
 
 async fn worker_loop(
     target: ClientTarget,
-    mut incoming: mpsc::UnboundedReceiver<SocialRequest>,
+    mut incoming: mpsc::Receiver<SocialRequest>,
     mut cancellation: watch::Receiver<bool>,
     outgoing: std_mpsc::Sender<Result<SocialResponse, ClientError>>,
 ) {

@@ -45,6 +45,7 @@ pub struct RenderedView {
     pub friends: Vec<RenderedFriend>,
     pub selected: Option<usize>,
     pub status: String,
+    pub busy: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +61,7 @@ pub struct OverlayModel {
     kind: ViewKind,
     status: String,
     outcome: UiOutcome,
+    request_in_flight: bool,
 }
 
 pub fn with_detached_view<T>(
@@ -103,6 +105,7 @@ impl OverlayModel {
             kind: ViewKind::Loading,
             status: "Loading friends".to_owned(),
             outcome: UiOutcome::Pending,
+            request_in_flight: true,
         }
     }
 
@@ -130,6 +133,7 @@ impl OverlayModel {
                 .collect(),
             selected: self.selected,
             status: self.status.clone(),
+            busy: self.request_in_flight,
         }
     }
 
@@ -138,6 +142,7 @@ impl OverlayModel {
     }
 
     pub fn apply_response(&mut self, response: SocialResponse) -> ModelEffect {
+        self.request_in_flight = false;
         match response {
             SocialResponse::Snapshot(snapshot) => {
                 self.friends = snapshot.friends;
@@ -171,12 +176,26 @@ impl OverlayModel {
     }
 
     pub fn service_failed(&mut self) {
-        self.kind = ViewKind::Error;
+        self.request_failed();
         self.status = "Xodus social service is unavailable".to_owned();
         self.outcome = UiOutcome::Failed;
     }
 
+    pub fn request_failed(&mut self) {
+        self.request_in_flight = false;
+        self.kind = ViewKind::Error;
+        self.status = "Unable to start request".to_owned();
+    }
+
     pub fn action(&mut self, action: UiAction) -> ModelEffect {
+        if self.request_in_flight
+            && matches!(
+                action,
+                UiAction::Activate | UiAction::Invite | UiAction::Join | UiAction::Refresh
+            )
+        {
+            return ModelEffect::None;
+        }
         match action {
             UiAction::MoveUp => {
                 self.move_selection(-1);
@@ -198,6 +217,8 @@ impl OverlayModel {
             UiAction::Refresh => {
                 self.kind = ViewKind::Loading;
                 self.status = "Refreshing friends".to_owned();
+                self.request_in_flight = true;
+                self.outcome = UiOutcome::Pending;
                 ModelEffect::Request(SocialRequest::RefreshFriends)
             }
             UiAction::Invite => self.selected_request(false),
@@ -240,6 +261,13 @@ impl OverlayModel {
                 friend: friend.handle,
             }
         };
+        self.request_in_flight = true;
+        self.status = if join {
+            "Joining friend".to_owned()
+        } else {
+            "Sending invite".to_owned()
+        };
+        self.outcome = UiOutcome::Pending;
         ModelEffect::Request(request)
     }
 

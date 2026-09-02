@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::mpsc;
 use std::thread;
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt, split};
 use xodus_overlay::action::{GamepadButton, GamepadInput, InputMapper, KeyInput, UiAction};
-use xodus_overlay::client::{ClientError, ClientWorker, SocialClient};
+use xodus_overlay::client::{ClientError, ClientWorker, ClientWorkerRequestError, SocialClient};
 use xodus_overlay::controller::{ControllerDeviceEvent, ControllerInputState, ControllerState};
 use xodus_overlay::model::{
     ModelEffect, OverlayModel, UiOutcome, ViewKind, with_action_effect, with_detached_view,
@@ -16,7 +16,7 @@ use xodus_overlay::model::{
 };
 use xodus_social_protocol::{
     FriendHandle, SocialFriend, SocialPresence, SocialRequest, SocialResponse, SocialSnapshot,
-    encode_frame, read_frame,
+    decode_frame, encode_frame, read_frame,
 };
 
 fn friend(label: &str, presence: SocialPresence) -> SocialFriend {
@@ -32,6 +32,17 @@ fn snapshot(friends: Vec<SocialFriend>) -> SocialResponse {
         friends,
         status: "synthetic service status".to_owned(),
     })
+}
+
+fn read_sync_request(stream: &mut StdUnixStream) -> SocialRequest {
+    let mut header = [0_u8; 10];
+    stream.read_exact(&mut header).unwrap();
+    assert_eq!(&header[..4], b"XDSO");
+    let length = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
+    let mut frame = Vec::from(header);
+    frame.resize(10 + length, 0);
+    stream.read_exact(&mut frame[10..]).unwrap();
+    decode_frame(&frame).unwrap()
 }
 
 #[test]
@@ -150,6 +161,7 @@ fn active_controller_change_rearms_stick_hysteresis() {
 fn model_covers_loading_empty_friends_error_success_and_cancellation() {
     let mut model = OverlayModel::new();
     assert_eq!(model.view().kind, ViewKind::Loading);
+    assert!(model.view().busy);
     assert_eq!(
         OverlayModel::initial_request(),
         SocialRequest::RefreshFriends
@@ -158,6 +170,7 @@ fn model_covers_loading_empty_friends_error_success_and_cancellation() {
     model.apply_response(snapshot(Vec::new()));
     assert_eq!(model.view().kind, ViewKind::Empty);
     assert_eq!(model.view().selected, None);
+    assert!(!model.view().busy);
 
     model.apply_response(snapshot(vec![friend("Driver One", SocialPresence::Online)]));
     assert_eq!(model.view().kind, ViewKind::Friends);
@@ -193,6 +206,7 @@ fn service_failure_remains_a_failure_when_the_error_view_is_closed() {
     let mut model = OverlayModel::new();
     model.service_failed();
 
+    assert!(!model.view().busy);
     assert_eq!(
         model.action(UiAction::Back),
         ModelEffect::Close(UiOutcome::Failed)
@@ -292,18 +306,27 @@ fn semantic_invite_join_and_activate_requests_carry_only_selected_handles() {
             friend: online_handle
         })
     );
+    model.apply_response(SocialResponse::Error {
+        message: "synthetic invite failure".to_owned(),
+    });
     assert_eq!(
         model.action(UiAction::Join),
         ModelEffect::Request(SocialRequest::JoinFriend {
             friend: online_handle
         })
     );
+    model.apply_response(SocialResponse::Error {
+        message: "synthetic join failure".to_owned(),
+    });
     assert_eq!(
         model.action(UiAction::Activate),
         ModelEffect::Request(SocialRequest::JoinFriend {
             friend: online_handle
         })
     );
+    model.apply_response(SocialResponse::Error {
+        message: "synthetic activation failure".to_owned(),
+    });
 
     model.action(UiAction::MoveDown);
     assert_eq!(
@@ -312,6 +335,124 @@ fn semantic_invite_join_and_activate_requests_carry_only_selected_handles() {
             friend: offline_handle
         })
     );
+}
+
+#[test]
+fn repeated_row_and_button_activation_emit_only_one_request() {
+    let selected = friend("Online", SocialPresence::Online);
+    let selected_handle = selected.handle;
+    let mut model = OverlayModel::new();
+    model.apply_response(snapshot(vec![selected]));
+
+    assert_eq!(
+        model.action(UiAction::Activate),
+        ModelEffect::Request(SocialRequest::JoinFriend {
+            friend: selected_handle
+        })
+    );
+    assert!(model.view().busy);
+    assert_eq!(model.action(UiAction::Activate), ModelEffect::None);
+    assert_eq!(model.action(UiAction::Invite), ModelEffect::None);
+    assert_eq!(model.action(UiAction::Join), ModelEffect::None);
+    assert_eq!(model.action(UiAction::Refresh), ModelEffect::None);
+}
+
+#[test]
+fn keyboard_and_controller_repeat_share_the_semantic_request_gate() {
+    let selected = friend("Online", SocialPresence::Online);
+    let selected_handle = selected.handle;
+    let mut model = OverlayModel::new();
+    model.apply_response(snapshot(vec![selected]));
+
+    let keyboard_action = InputMapper::key(KeyInput::I).unwrap();
+    assert_eq!(
+        model.action(keyboard_action),
+        ModelEffect::Request(SocialRequest::InviteFriend {
+            friend: selected_handle
+        })
+    );
+    assert_eq!(model.action(keyboard_action), ModelEffect::None);
+
+    model.apply_response(SocialResponse::Error {
+        message: "synthetic keyboard failure".to_owned(),
+    });
+    let mut mapper = InputMapper::default();
+    let controller_action = mapper
+        .gamepad(GamepadInput::ButtonPressed(GamepadButton::West))
+        .unwrap();
+    assert_eq!(
+        model.action(controller_action),
+        ModelEffect::Request(SocialRequest::InviteFriend {
+            friend: selected_handle
+        })
+    );
+    assert_eq!(model.action(controller_action), ModelEffect::None);
+}
+
+#[test]
+fn response_and_request_failures_clear_busy_state_for_retry() {
+    let selected = friend("Online", SocialPresence::Online);
+    let mut model = OverlayModel::new();
+    model.apply_response(snapshot(vec![selected]));
+
+    assert!(matches!(
+        model.action(UiAction::Invite),
+        ModelEffect::Request(_)
+    ));
+    model.apply_response(SocialResponse::Error {
+        message: "synthetic safe error".to_owned(),
+    });
+    assert!(!model.view().busy);
+    assert!(matches!(
+        model.action(UiAction::Refresh),
+        ModelEffect::Request(SocialRequest::RefreshFriends)
+    ));
+
+    model.request_failed();
+    assert!(!model.view().busy);
+    assert!(matches!(
+        model.action(UiAction::Refresh),
+        ModelEffect::Request(SocialRequest::RefreshFriends)
+    ));
+}
+
+#[test]
+fn navigation_and_cancel_remain_available_while_a_request_is_busy() {
+    let mut model = OverlayModel::new();
+    model.apply_response(snapshot(vec![
+        friend("One", SocialPresence::Online),
+        friend("Two", SocialPresence::Offline),
+    ]));
+    assert!(matches!(
+        model.action(UiAction::Invite),
+        ModelEffect::Request(_)
+    ));
+
+    assert_eq!(model.action(UiAction::MoveDown), ModelEffect::None);
+    assert_eq!(model.view().selected, Some(1));
+    assert_eq!(
+        model.action(UiAction::Back),
+        ModelEffect::Close(UiOutcome::Cancelled)
+    );
+}
+
+#[test]
+fn successful_action_clears_busy_state_and_closes() {
+    let mut model = OverlayModel::new();
+    model.apply_response(snapshot(vec![friend("Online", SocialPresence::Online)]));
+    assert!(matches!(
+        model.action(UiAction::Join),
+        ModelEffect::Request(_)
+    ));
+
+    assert_eq!(
+        model.apply_response(SocialResponse::Success {
+            message: "synthetic success".to_owned(),
+        }),
+        ModelEffect::Close(UiOutcome::Completed)
+    );
+    assert!(!model.view().busy);
+    assert_eq!(model.outcome(), UiOutcome::Completed);
 }
 
 #[test]
@@ -461,4 +602,57 @@ fn client_worker_stop_interrupts_in_flight_request_and_is_idempotent() {
     confirmation
         .recv_timeout(Duration::from_secs(1))
         .expect("worker shutdown must interrupt a blocked response read");
+}
+
+#[test]
+fn client_worker_queue_is_bounded_nonblocking_and_recovers_after_full() {
+    let (client_socket, mut server_socket) = StdUnixStream::pair().unwrap();
+    server_socket
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let (mut worker, responses) = ClientWorker::from_stream(client_socket);
+
+    worker.request(SocialRequest::Snapshot).unwrap();
+    assert_eq!(
+        read_sync_request(&mut server_socket),
+        SocialRequest::Snapshot
+    );
+
+    worker.request(SocialRequest::RefreshFriends).unwrap();
+    assert_eq!(
+        worker.request(SocialRequest::Snapshot),
+        Err(ClientWorkerRequestError::Full)
+    );
+
+    server_socket
+        .write_all(
+            &encode_frame(&SocialResponse::Success {
+                message: "synthetic first response".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        responses.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Ok(SocialResponse::Success { .. })
+    ));
+    assert_eq!(
+        read_sync_request(&mut server_socket),
+        SocialRequest::RefreshFriends
+    );
+    server_socket
+        .write_all(
+            &encode_frame(&SocialResponse::Success {
+                message: "synthetic second response".to_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        responses.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Ok(SocialResponse::Success { .. })
+    ));
+
+    worker.request(SocialRequest::Snapshot).unwrap();
+    worker.stop();
 }
