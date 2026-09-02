@@ -1,0 +1,355 @@
+use std::collections::HashSet;
+
+use tokio::io::{AsyncWriteExt, split};
+use xodus::forza::ipc::{encode_frame, read_frame};
+use xodus::forza::{
+    FriendHandle, SocialFriend, SocialPresence, SocialRequest, SocialResponse, SocialSnapshot,
+};
+use xodus_overlay::action::{GamepadButton, GamepadInput, InputMapper, KeyInput, UiAction};
+use xodus_overlay::client::{ClientError, SocialClient};
+use xodus_overlay::controller::{ControllerDeviceEvent, ControllerState};
+use xodus_overlay::model::{ModelEffect, OverlayModel, UiOutcome, ViewKind};
+
+fn friend(label: &str, presence: SocialPresence) -> SocialFriend {
+    SocialFriend {
+        handle: FriendHandle::new(),
+        display_label: label.to_owned(),
+        presence,
+    }
+}
+
+fn snapshot(friends: Vec<SocialFriend>) -> SocialResponse {
+    SocialResponse::Snapshot(SocialSnapshot {
+        friends,
+        status: "synthetic service status".to_owned(),
+    })
+}
+
+#[test]
+fn every_keyboard_and_xbox_button_maps_to_the_required_semantic_action() {
+    let keyboard = [
+        (KeyInput::Up, UiAction::MoveUp),
+        (KeyInput::W, UiAction::MoveUp),
+        (KeyInput::Down, UiAction::MoveDown),
+        (KeyInput::S, UiAction::MoveDown),
+        (KeyInput::Enter, UiAction::Activate),
+        (KeyInput::Space, UiAction::Activate),
+        (KeyInput::Escape, UiAction::Back),
+        (KeyInput::Backspace, UiAction::Back),
+        (KeyInput::I, UiAction::Invite),
+        (KeyInput::J, UiAction::Join),
+        (KeyInput::R, UiAction::Refresh),
+        (KeyInput::F5, UiAction::Refresh),
+    ];
+    for (input, expected) in keyboard {
+        assert_eq!(InputMapper::key(input), Some(expected));
+    }
+    assert_eq!(InputMapper::key(KeyInput::Other), None);
+
+    let controller = [
+        (GamepadButton::DPadUp, UiAction::MoveUp),
+        (GamepadButton::DPadDown, UiAction::MoveDown),
+        (GamepadButton::South, UiAction::Activate),
+        (GamepadButton::East, UiAction::Back),
+        (GamepadButton::West, UiAction::Invite),
+        (GamepadButton::North, UiAction::Join),
+        (GamepadButton::Start, UiAction::Refresh),
+    ];
+    let mut mapper = InputMapper::default();
+    for (button, expected) in controller {
+        assert_eq!(
+            mapper.gamepad(GamepadInput::ButtonPressed(button)),
+            Some(expected)
+        );
+    }
+    assert_eq!(
+        mapper.gamepad(GamepadInput::ButtonPressed(GamepadButton::Other)),
+        None
+    );
+
+    assert_eq!(
+        InputMapper::key(KeyInput::Enter),
+        InputMapper::default().gamepad(GamepadInput::ButtonPressed(GamepadButton::South))
+    );
+    assert_eq!(
+        InputMapper::key(KeyInput::Escape),
+        InputMapper::default().gamepad(GamepadInput::ButtonPressed(GamepadButton::East))
+    );
+}
+
+#[test]
+fn stick_crossing_is_suppressed_until_neutral_and_direction_changes_emit_once() {
+    let mut mapper = InputMapper::default();
+    assert_eq!(
+        mapper.gamepad(GamepadInput::LeftY(-20_000)),
+        Some(UiAction::MoveUp)
+    );
+    assert_eq!(mapper.gamepad(GamepadInput::LeftY(-25_000)), None);
+    assert_eq!(mapper.gamepad(GamepadInput::LeftY(-10_000)), None);
+    assert_eq!(mapper.gamepad(GamepadInput::LeftY(0)), None);
+    assert_eq!(
+        mapper.gamepad(GamepadInput::LeftY(-20_000)),
+        Some(UiAction::MoveUp)
+    );
+    assert_eq!(
+        mapper.gamepad(GamepadInput::LeftY(20_000)),
+        Some(UiAction::MoveDown)
+    );
+    assert_eq!(mapper.gamepad(GamepadInput::LeftY(25_000)), None);
+}
+
+#[test]
+fn controller_state_survives_zero_hotplug_and_active_removal() {
+    let mut state = ControllerState::default();
+    assert_eq!(state.active(), None);
+
+    state.apply(ControllerDeviceEvent::Added(7));
+    state.apply(ControllerDeviceEvent::Added(3));
+    assert_eq!(state.active(), Some(7));
+    assert_eq!(state.devices(), HashSet::from([3, 7]));
+
+    state.apply(ControllerDeviceEvent::Removed(7));
+    assert_eq!(state.active(), Some(3));
+    assert_eq!(state.devices(), HashSet::from([3]));
+
+    state.apply(ControllerDeviceEvent::Removed(3));
+    state.apply(ControllerDeviceEvent::Removed(999));
+    assert_eq!(state.active(), None);
+    assert!(state.devices().is_empty());
+}
+
+#[test]
+fn model_covers_loading_empty_friends_error_success_and_cancellation() {
+    let mut model = OverlayModel::new();
+    assert_eq!(model.view().kind, ViewKind::Loading);
+    assert_eq!(
+        OverlayModel::initial_request(),
+        SocialRequest::RefreshFriends
+    );
+
+    model.apply_response(snapshot(Vec::new()));
+    assert_eq!(model.view().kind, ViewKind::Empty);
+    assert_eq!(model.view().selected, None);
+
+    model.apply_response(snapshot(vec![friend("Driver One", SocialPresence::Online)]));
+    assert_eq!(model.view().kind, ViewKind::Friends);
+    assert_eq!(model.view().selected, Some(0));
+
+    model.apply_response(SocialResponse::Error {
+        message: "Selected friend is no longer available".to_owned(),
+    });
+    assert_eq!(model.view().kind, ViewKind::Error);
+    assert_eq!(model.view().friends.len(), 1);
+
+    assert_eq!(
+        model.apply_response(SocialResponse::Success {
+            message: "Invite sent".to_owned(),
+        }),
+        ModelEffect::Close(UiOutcome::Completed)
+    );
+    assert_eq!(model.view().kind, ViewKind::Success);
+    assert_eq!(model.outcome(), UiOutcome::Completed);
+
+    assert_eq!(
+        model.action(UiAction::Back),
+        ModelEffect::Close(UiOutcome::Cancelled)
+    );
+    assert_eq!(model.view().kind, ViewKind::Cancelled);
+    assert_eq!(UiOutcome::Completed.exit_code(), 0);
+    assert_eq!(UiOutcome::Cancelled.exit_code(), 1);
+    assert_eq!(UiOutcome::Failed.exit_code(), 2);
+}
+
+#[test]
+fn service_failure_remains_a_failure_when_the_error_view_is_closed() {
+    let mut model = OverlayModel::new();
+    model.service_failed();
+
+    assert_eq!(
+        model.action(UiAction::Back),
+        ModelEffect::Close(UiOutcome::Failed)
+    );
+    assert_eq!(model.outcome(), UiOutcome::Failed);
+}
+
+#[test]
+fn model_keeps_selection_safe_and_clamps_it_after_refresh() {
+    let mut model = OverlayModel::new();
+    assert_eq!(model.action(UiAction::Invite), ModelEffect::None);
+    assert_eq!(model.action(UiAction::Join), ModelEffect::None);
+    assert_eq!(model.action(UiAction::Activate), ModelEffect::None);
+
+    model.apply_response(snapshot(vec![
+        friend("One", SocialPresence::Online),
+        friend("Two", SocialPresence::Offline),
+        friend("Three", SocialPresence::Unknown),
+    ]));
+    model.action(UiAction::MoveDown);
+    model.action(UiAction::MoveDown);
+    assert_eq!(model.view().selected, Some(2));
+
+    model.apply_response(snapshot(vec![friend("Only", SocialPresence::Online)]));
+    assert_eq!(model.view().selected, Some(0));
+
+    model.apply_response(snapshot(Vec::new()));
+    assert_eq!(model.view().selected, None);
+}
+
+#[test]
+fn semantic_invite_join_and_activate_requests_carry_only_selected_handles() {
+    let online = friend("Online", SocialPresence::Online);
+    let online_handle = online.handle;
+    let offline = friend("Offline", SocialPresence::Offline);
+    let offline_handle = offline.handle;
+    let mut model = OverlayModel::new();
+    model.apply_response(snapshot(vec![online, offline]));
+
+    assert_eq!(
+        model.action(UiAction::Invite),
+        ModelEffect::Request(SocialRequest::InviteFriend {
+            friend: online_handle
+        })
+    );
+    assert_eq!(
+        model.action(UiAction::Join),
+        ModelEffect::Request(SocialRequest::JoinFriend {
+            friend: online_handle
+        })
+    );
+    assert_eq!(
+        model.action(UiAction::Activate),
+        ModelEffect::Request(SocialRequest::JoinFriend {
+            friend: online_handle
+        })
+    );
+
+    model.action(UiAction::MoveDown);
+    assert_eq!(
+        model.action(UiAction::Activate),
+        ModelEffect::Request(SocialRequest::InviteFriend {
+            friend: offline_handle
+        })
+    );
+}
+
+#[test]
+fn rendered_model_ignores_protocol_status_and_action_message_secrets() {
+    let mut model = OverlayModel::new();
+    model.apply_response(SocialResponse::Snapshot(SocialSnapshot {
+        friends: vec![friend("Safe Driver", SocialPresence::Unknown)],
+        status: "2810999999999999 synthetic-token ms-xbl-multiplayer://secret".to_owned(),
+    }));
+    model.apply_response(SocialResponse::Error {
+        message: "synthetic-connection-string synthetic-authorization".to_owned(),
+    });
+
+    let rendered = format!("{:?}", model.view());
+    for sentinel in [
+        "2810999999999999",
+        "synthetic-token",
+        "ms-xbl-multiplayer",
+        "synthetic-connection-string",
+        "synthetic-authorization",
+    ] {
+        assert!(!rendered.contains(sentinel), "rendered {sentinel}");
+    }
+    assert!(rendered.contains("Safe Driver"));
+}
+
+#[tokio::test]
+async fn client_reads_one_byte_fragmented_xdso_response() {
+    let (client_socket, server_socket) = tokio::net::UnixStream::pair().unwrap();
+    let client = SocialClient::from_stream(client_socket);
+    let (mut server_reader, mut server_writer) = split(server_socket);
+    let server = tokio::spawn(async move {
+        assert_eq!(
+            read_frame::<_, SocialRequest>(&mut server_reader)
+                .await
+                .unwrap(),
+            SocialRequest::RefreshFriends
+        );
+        let response = snapshot(Vec::new());
+        for byte in encode_frame(&response).unwrap() {
+            server_writer.write_all(&[byte]).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+
+    assert!(matches!(
+        client.request(SocialRequest::RefreshFriends).await.unwrap(),
+        SocialResponse::Snapshot(_)
+    ));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_turns_service_disconnect_into_a_fixed_safe_error() {
+    let (client_socket, server_socket) = tokio::net::UnixStream::pair().unwrap();
+    let client = SocialClient::from_stream(client_socket);
+    let server = tokio::spawn(async move {
+        let (mut reader, _) = split(server_socket);
+        read_frame::<_, SocialRequest>(&mut reader).await.unwrap();
+    });
+
+    assert_eq!(
+        client.request(SocialRequest::Snapshot).await.unwrap_err(),
+        ClientError::Disconnected
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_client_requests_are_serialized_as_complete_frames() {
+    let (client_socket, server_socket) = tokio::net::UnixStream::pair().unwrap();
+    let client = SocialClient::from_stream(client_socket);
+    let server = tokio::spawn(async move {
+        let (mut reader, mut writer) = split(server_socket);
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let request = read_frame::<_, SocialRequest>(&mut reader).await.unwrap();
+            let message = match request {
+                SocialRequest::Snapshot => "snapshot",
+                SocialRequest::RefreshFriends => "refresh",
+                _ => panic!("unexpected action request"),
+            };
+            seen.push(message);
+            let response = SocialResponse::Success {
+                message: message.to_owned(),
+            };
+            writer
+                .write_all(&encode_frame(&response).unwrap())
+                .await
+                .unwrap();
+        }
+        seen
+    });
+
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            (
+                "snapshot",
+                client.request(SocialRequest::Snapshot).await.unwrap(),
+            )
+        })
+    };
+    let second = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            (
+                "refresh",
+                client.request(SocialRequest::RefreshFriends).await.unwrap(),
+            )
+        })
+    };
+
+    for (expected, response) in [first.await.unwrap(), second.await.unwrap()] {
+        assert_eq!(
+            response,
+            SocialResponse::Success {
+                message: expected.to_owned()
+            }
+        );
+    }
+    assert_eq!(server.await.unwrap().len(), 2);
+}
