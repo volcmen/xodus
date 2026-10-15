@@ -96,7 +96,7 @@ impl<'a> RSTSignature<'a> {
             RSTSignature::Rsa(private_key) => {
                 let public_key = rsa::RsaPublicKey::from(private_key.as_ref());
                 bergshamra::KeyData::Rsa {
-                    private: Some(private_key.as_ref().clone()),
+                    private: None,
                     public: public_key,
                 }
             }

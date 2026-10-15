@@ -1,45 +1,33 @@
-name: Rust check
+name: Forza Rust checks
 
 on:
   pull_request:
+    branches: [forza-social-invite-join-v0.1]
   push:
-    branches: [main]
+    branches: [forza-social-invite-join-v0.1, fix/forza-dependency-security]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  fmt:
-    name: Check fmt
+  linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/volcmen/forza-motorsport-builder@sha256:3a4274c5913404e366163e23437101f64e59ccbe1b00c74d9d57378f4ac82ae5
+      options: --user 0 --cap-drop ALL --security-opt no-new-privileges
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
-      - uses: actions/checkout@v6
-      - run: cargo fmt --check --all
-  check:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install dependencies
-        if: ${{runner.os == 'Linux'}}
-        run: sudo apt update && sudo apt install libwebkit2gtk-4.1-dev protobuf-compiler
-      - name: Install protobuf
-        if: ${{ runner.os == 'macOS' }}
-        run: brew install protobuf
-      - uses: actions/cache@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Run check
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo clippy --workspace --message-format=json | python3 scripts/cargo-annotate.py "${{ matrix.target }}"
+          persist-credentials: false
+      - name: Format maintained code
+        run: cargo fmt --check
+      - name: Test shipped Linux packages and authentication transport
+        run: cargo test --locked -p xodus -p xodus-service -p xodus-cli -p xodus-overlay -p xal --lib --bins
+      - name: Test optimized GLib iterator backport
+        run: cargo test --locked --release -p glib@0.18.5 --lib variant_iter

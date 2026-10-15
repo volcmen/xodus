@@ -85,11 +85,23 @@ pub fn sign_xml(
     )?;
 
     let mut kmgr = bergshamra::KeysManager::new();
-    kmgr.add_key(bergshamra::Key::new(
-        signature.signing_key(nonce),
-        bergshamra::KeyUsage::Sign,
-    ));
-    let ctx = bergshamra::DsigContext::new(kmgr).with_strict_verification(false);
+    let mut ctx = match signature {
+        rst::RSTSignature::Rsa(private_key) => {
+            // Use the backend hook for OpenSSL's blinded private-key operation.
+            // RustCrypto RSA remains for key parsing and public verification only.
+            let mut ctx = bergshamra::DsigContext::new(kmgr);
+            ctx.hsm_signer = Some(Box::new(rst::OpenSslRsaSigner::new(private_key)?));
+            ctx
+        }
+        rst::RSTSignature::Hmac { .. } => {
+            kmgr.add_key(bergshamra::Key::new(
+                signature.signing_key(nonce),
+                bergshamra::KeyUsage::Sign,
+            ));
+            bergshamra::DsigContext::new(kmgr)
+        }
+    };
+    ctx.strict_verification = false;
     let signed = bergshamra::sign(&ctx, std::str::from_utf8(&min_xml).unwrap())?;
     Ok(signed)
 }
