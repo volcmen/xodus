@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 30
     container:
       image: ghcr.io/volcmen/forza-motorsport-builder@sha256:3a4274c5913404e366163e23437101f64e59ccbe1b00c74d9d57378f4ac82ae5
-      options: --user 0 --cap-drop ALL --security-opt no-new-privileges
+      options: --user 1001:1001 --cap-drop ALL --security-opt no-new-privileges
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_DEBUG: 0
