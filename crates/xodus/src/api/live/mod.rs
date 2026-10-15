@@ -138,6 +138,7 @@ mod test {
     };
 
     #[tokio::test]
+    #[ignore = "requires live Microsoft services and creates device credentials"]
     async fn test_get_xbox_live_dev_token() {
         let client = reqwest::Client::new();
 
@@ -163,6 +164,6 @@ mod test {
             todo!("Unsupported token");
         };
 
-        println!("{}", ms_device_token);
+        assert!(!ms_device_token.is_empty());
     }
 }

@@ -1,15 +1,17 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "vendor/xal", "vendor/glib-0.18"]
+default-members = ["crates/*"]
 
 [workspace.dependencies]
 chrono = "0.4.42"
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest = { version = "0.13.4", features = ["json", "stream", "query"] }
 tokio = { version = "1", features = ["full"] }
 base64 = { version = "0.22.1" }
 url = "2.5.8"
 
 [patch.crates-io]
+glib018 = { package = "glib", path = "vendor/glib-0.18" }
 ntfs = { git = "https://github.com/xodus-gaming/ntfs.git" }
 
 # xal with `RequestSigner::with_keypair` / `XalAuthenticator::set_request_signer`, so
@@ -17,4 +19,4 @@ ntfs = { git = "https://github.com/xodus-gaming/ntfs.git" }
 # the caller cannot sign requests carrying a token minted here, and every signed Xbox
 # Live call goes out unsigned. Branched from the rev the git dependency already pins.
 [patch."https://github.com/xodus-gaming/xal-rs"]
-xal = { git = "https://github.com/AllanVester/xal-rs", rev = "231f7528cda1dee1aac09225d09fcd67d76980e0" }
+xal = { path = "vendor/xal" }
